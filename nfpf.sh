@@ -148,9 +148,6 @@ list_forwards() {
         return 0
     fi
     
-    log_info "当前端口转发规则："
-    echo
-    
     # 强制刷新nftables状态，确保获取最新规则
     refresh_nftables_state
     
@@ -160,13 +157,13 @@ list_forwards() {
     local rules_output=""
     
     while [[ $attempt -le $max_attempts ]]; do
-        log_info "尝试获取规则列表 (第 $attempt 次)..."
+        # log_info "尝试获取规则列表 (第 $attempt 次)..."
         
         # 检查是否存在规则
         rules_output=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null)
         
         if echo "$rules_output" | grep -q "dnat to"; then
-            log_success "成功获取到规则列表"
+            # log_success "成功获取到规则列表"
             break
         else
             log_warning "第 $attempt 次尝试未找到规则，等待后重试..."
@@ -210,9 +207,6 @@ list_forwards() {
 parse_and_display_rule() {
     local rule="$1"
     local id="$2"
-    
-    # 添加调试日志
-    log_info "解析规则: $rule"
     
     # 提取规则信息 - 使用更健壮的解析方式
     local protocol=$(echo "$rule" | grep -oE '\b(tcp|udp)\b' | head -1)
@@ -300,9 +294,6 @@ create_forward() {
     if nft ${rule} && nft ${snat_rule}; then
         log_success "端口转发规则创建成功: ${src_port} -> ${dst_ip}:${dst_port} (${protocol})"
         
-        # 立即刷新nftables状态，确保规则生效
-        refresh_nftables_state
-        
         # 验证规则是否成功添加
         log_info "验证规则是否正确添加..."
         local verify_attempts=0
@@ -328,9 +319,6 @@ create_forward() {
         fi
         
         save_config
-        
-        # 再次刷新nftables状态，确保当前会话能立即读取到最新规则
-        refresh_nftables_state
         
         return 0
     else
@@ -455,7 +443,7 @@ refresh_nftables_state() {
     # 再次强制刷新，确保状态最新
     nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} >/dev/null 2>&1
     
-    log_success "nftables状态已刷新"
+    # log_success "nftables状态已刷新"
 }
 
 # 保存配置
@@ -463,9 +451,6 @@ save_config() {
     log_info "保存nftables配置..."
     if nft list ruleset > /etc/nftables.conf; then
         log_success "配置已保存到 /etc/nftables.conf"
-        
-        # 刷新nftables状态，确保配置变更立即生效
-        refresh_nftables_state
         
         return 0
     else
