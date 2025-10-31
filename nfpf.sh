@@ -2,7 +2,7 @@
 
 # nftables端口转发管理脚本
 # 适用于Debian系Linux发行版
-# 作者: GitHub Copilot
+# 作者: fonlan
 # 版本: 1.0
 
 set -euo pipefail
@@ -151,9 +151,37 @@ list_forwards() {
     log_info "当前端口转发规则："
     echo
     
-    # 检查是否存在规则
-    if ! nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | grep -q "dnat to"; then
-        log_warning "未找到任何端口转发规则"
+    # 强制刷新nftables状态，确保获取最新规则
+    refresh_nftables_state
+    
+    # 添加重试机制，最多重试3次
+    local max_attempts=3
+    local attempt=1
+    local rules_output=""
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        log_info "尝试获取规则列表 (第 $attempt 次)..."
+        
+        # 检查是否存在规则
+        rules_output=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null)
+        
+        if echo "$rules_output" | grep -q "dnat to"; then
+            log_success "成功获取到规则列表"
+            break
+        else
+            log_warning "第 $attempt 次尝试未找到规则，等待后重试..."
+            if [[ $attempt -lt $max_attempts ]]; then
+                sleep 1
+                refresh_nftables_state
+            fi
+        fi
+        
+        ((attempt++))
+    done
+    
+    # 如果所有尝试都失败
+    if ! echo "$rules_output" | grep -q "dnat to"; then
+        log_warning "经过 $max_attempts 次尝试后，仍未找到任何端口转发规则"
         return 0
     fi
     
@@ -162,15 +190,20 @@ list_forwards() {
     printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "------" "--------" "---------------" "----------" "---------------" "----------" "----------"
     
     # 解析并显示规则
-    local rules=$(nft --handle list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | grep "dnat to")
+    local rules=$(echo "$rules_output" | grep "dnat to")
     local counter=1
     
-    while IFS= read -r rule; do
-        if [[ -n "$rule" ]]; then
-            parse_and_display_rule "$rule" "$counter"
-            ((counter++))
-        fi
-    done <<< "$rules"
+    # 使用更可靠的方式处理规则
+    if [[ -n "$rules" ]]; then
+        while IFS= read -r rule; do
+            if [[ -n "$rule" ]]; then
+                parse_and_display_rule "$rule" "$counter"
+                ((counter++))
+            fi
+        done <<< "$rules"
+    else
+        log_warning "未找到任何端口转发规则"
+    fi
 }
 
 # 解析并显示单个规则
@@ -178,13 +211,48 @@ parse_and_display_rule() {
     local rule="$1"
     local id="$2"
     
-    # 提取规则信息
-    local protocol=$(echo "$rule" | grep -o 'tcp\|udp' || echo "tcp")
-    local src_port=$(echo "$rule" | grep -o 'dport [0-9]*' | awk '{print $2}' || echo "any")
-    local dst_info=$(echo "$rule" | grep -o 'dnat to [0-9.]*:[0-9]*' | sed 's/dnat to //')
-    local dst_ip=$(echo "$dst_info" | cut -d':' -f1)
-    local dst_port=$(echo "$dst_info" | cut -d':' -f2)
-    local interface=$(echo "$rule" | grep -o 'iifname "[^"]*"' | sed 's/iifname "//; s/"//' || echo "any")
+    # 添加调试日志
+    log_info "解析规则: $rule"
+    
+    # 提取规则信息 - 使用更健壮的解析方式
+    local protocol=$(echo "$rule" | grep -oE '\b(tcp|udp)\b' | head -1)
+    [[ -z "$protocol" ]] && protocol="tcp"
+    
+    local src_port=$(echo "$rule" | grep -oE 'dport\s+[0-9]+' | awk '{print $2}' | head -1)
+    [[ -z "$src_port" ]] && src_port="any"
+    
+    # 尝试多种格式解析目标信息
+    local dst_info=$(echo "$rule" | grep -oE 'dnat\s+to\s+[0-9.]+:[0-9]+' | sed 's/dnat to //')
+    if [[ -n "$dst_info" ]]; then
+        local dst_ip=$(echo "$dst_info" | cut -d':' -f1)
+        local dst_port=$(echo "$dst_info" | cut -d':' -f2)
+    else
+        # 尝试另一种格式
+        dst_info=$(echo "$rule" | grep -oE 'dnat\s+to\s+[0-9.]+\s+[0-9]+' | sed 's/dnat to /:/')
+        if [[ -n "$dst_info" ]]; then
+            local dst_ip=$(echo "$dst_info" | cut -d':' -f1)
+            local dst_port=$(echo "$dst_info" | cut -d':' -f2)
+        else
+            # 尝试第三种格式（不带冒号）
+            dst_info=$(echo "$rule" | grep -oE 'dnat\s+to\s+[0-9.]+' | sed 's/dnat to //')
+            if [[ -n "$dst_info" ]]; then
+                local dst_ip="$dst_info"
+                local dst_port="$src_port"  # 假设目标端口与源端口相同
+            else
+                dst_ip="unknown"
+                dst_port="unknown"
+                log_warning "无法解析规则的目标信息: $rule"
+            fi
+        fi
+    fi
+    
+    local interface=$(echo "$rule" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1)
+    [[ -z "$interface" ]] && interface="any"
+    
+    # 验证解析结果
+    if [[ "$dst_ip" == "unknown" || "$dst_port" == "unknown" ]]; then
+        log_warning "规则解析不完整，显示为未知值"
+    fi
     
     printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface"
 }
@@ -231,7 +299,39 @@ create_forward() {
     # 执行规则
     if nft ${rule} && nft ${snat_rule}; then
         log_success "端口转发规则创建成功: ${src_port} -> ${dst_ip}:${dst_port} (${protocol})"
+        
+        # 立即刷新nftables状态，确保规则生效
+        refresh_nftables_state
+        
+        # 验证规则是否成功添加
+        log_info "验证规则是否正确添加..."
+        local verify_attempts=0
+        local max_verify_attempts=3
+        local verify_success=false
+        
+        while [[ $verify_attempts -lt $max_verify_attempts && $verify_success == false ]]; do
+            if verify_forward_rule "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface"; then
+                log_success "规则验证成功"
+                verify_success=true
+            else
+                ((verify_attempts++))
+                if [[ $verify_attempts -lt $max_verify_attempts ]]; then
+                    log_warning "第 $verify_attempts 次验证失败，等待后重试..."
+                    sleep 1
+                    refresh_nftables_state
+                fi
+            fi
+        done
+        
+        if [[ $verify_success == false ]]; then
+            log_warning "经过 $max_verify_attempts 次尝试后，规则验证仍然失败，但规则可能已添加"
+        fi
+        
         save_config
+        
+        # 再次刷新nftables状态，确保当前会话能立即读取到最新规则
+        refresh_nftables_state
+        
         return 0
     else
         log_error "创建端口转发规则失败"
@@ -298,11 +398,80 @@ modify_forward() {
     fi
 }
 
+# 验证端口转发规则是否正确添加
+verify_forward_rule() {
+    local protocol="$1"
+    local src_port="$2"
+    local dst_ip="$3"
+    local dst_port="$4"
+    local interface="${5:-}"
+    
+    # 构建验证查询
+    local verify_query="nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING}"
+    
+    # 检查DNAT规则
+    local dnat_rule=$($verify_query 2>/dev/null | grep "${protocol} dport ${src_port}" | grep "dnat to ${dst_ip}:${dst_port}")
+    
+    if [[ -z "$dnat_rule" ]]; then
+        log_error "DNAT规则验证失败: 未找到匹配的规则"
+        return 1
+    fi
+    
+    # 如果指定了接口，验证接口是否匹配
+    if [[ -n "$interface" ]]; then
+        if ! echo "$dnat_rule" | grep -q "iifname \"$interface\""; then
+            log_error "接口验证失败: 规则中接口不匹配"
+            return 1
+        fi
+    fi
+    
+    # 检查SNAT规则
+    local snat_rule=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_POSTROUTING} 2>/dev/null | \
+                     grep "ip daddr ${dst_ip}" | grep "${protocol} dport ${dst_port}" | grep "masquerade")
+    
+    if [[ -z "$snat_rule" ]]; then
+        log_warning "SNAT规则验证失败: 未找到匹配的规则"
+        # 不返回失败，因为某些情况下可能不需要SNAT规则
+    fi
+    
+    return 0
+}
+
+# 刷新nftables状态
+refresh_nftables_state() {
+    log_info "刷新nftables状态..."
+    
+    # 强制重新读取nftables状态
+    nft list ruleset >/dev/null 2>&1
+    
+    # 清除可能的缓存
+    nft list table ip ${NFT_TABLE} >/dev/null 2>&1
+    nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} >/dev/null 2>&1
+    nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_POSTROUTING} >/dev/null 2>&1
+    
+    # 添加短暂延迟，确保nftables有足够时间内部同步
+    sleep 0.5
+    
+    # 再次强制刷新，确保状态最新
+    nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} >/dev/null 2>&1
+    
+    log_success "nftables状态已刷新"
+}
+
 # 保存配置
 save_config() {
     log_info "保存nftables配置..."
-    nft list ruleset > /etc/nftables.conf
-    log_success "配置已保存到 /etc/nftables.conf"
+    if nft list ruleset > /etc/nftables.conf; then
+        log_success "配置已保存到 /etc/nftables.conf"
+        
+        # 刷新nftables状态，确保配置变更立即生效
+        refresh_nftables_state
+        
+        return 0
+    else
+        log_error "保存配置失败"
+        return 1
+    fi
 }
 
 # 交互式创建端口转发
