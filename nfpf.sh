@@ -183,8 +183,8 @@ list_forwards() {
     fi
     
     # 显示表头
-    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "ID" "协议" "源IP" "源端口" "目标IP" "目标端口" "接口"
-    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "------" "--------" "---------------" "----------" "---------------" "----------" "----------"
+    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s %-30s\n" "ID" "协议" "源IP" "源端口" "目标IP" "目标端口" "接口" "描述"
+    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s %-30s\n" "------" "--------" "---------------" "----------" "---------------" "----------" "----------" "------------------------------"
     
     # 解析并显示规则
     local rules=$(echo "$rules_output" | grep "dnat to")
@@ -243,12 +243,71 @@ parse_and_display_rule() {
     local interface=$(echo "$rule" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1)
     [[ -z "$interface" ]] && interface="any"
     
+    # 提取注释信息
+    local comment=$(echo "$rule" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
+    local description=""
+    
+    if [[ -n "$comment" ]]; then
+        # 解析注释格式: "nfpf:描述信息|创建时间|修改时间"
+        if [[ "$comment" =~ ^nfpf:([^|]+) ]]; then
+            description="${BASH_REMATCH[1]}"
+        else
+            description="$comment"
+        fi
+    fi
+    
+    # 如果描述为空，显示为"无"
+    [[ -z "$description" ]] && description="无"
+    
     # 验证解析结果
     if [[ "$dst_ip" == "unknown" || "$dst_port" == "unknown" ]]; then
         log_warning "规则解析不完整，显示为未知值"
     fi
     
-    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface"
+    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s %-30s\n" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface" "$description"
+}
+
+# 从规则中提取注释信息
+parse_comment_from_rule() {
+    local rule="$1"
+    
+    # 提取comment部分
+    local comment=$(echo "$rule" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
+    
+    if [[ -n "$comment" ]]; then
+        # 解析注释格式: "nfpf:描述信息|创建时间|修改时间"
+        if [[ "$comment" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
+            local description="${BASH_REMATCH[1]}"
+            local created_time="${BASH_REMATCH[2]}"
+            local modified_time="${BASH_REMATCH[3]}"
+            
+            echo "描述: $description"
+            echo "创建时间: $created_time"
+            echo "修改时间: $modified_time"
+        else
+            echo "注释: $comment"
+        fi
+    else
+        echo "无注释"
+    fi
+}
+
+# 格式化注释为 nftables 可用格式
+format_comment_for_nftables() {
+    local description="$1"
+    local created_time="${2:-$(date -Iseconds)}"
+    local modified_time="${3:-$(date -Iseconds)}"
+    
+    # 限制描述信息在50字符以内
+    if [[ ${#description} -gt 50 ]]; then
+        description="${description:0:47}..."
+    fi
+    
+    # 清理描述中的特殊字符，避免nftables解析问题
+    description=$(echo "$description" | sed 's/"/\\"/g')
+    
+    # 格式为 "nfpf:描述信息|创建时间|修改时间"
+    echo "nfpf:${description}|${created_time}|${modified_time}"
 }
 
 # 创建端口转发规则
@@ -258,6 +317,7 @@ create_forward() {
     local dst_ip="$3"
     local dst_port="$4"
     local interface="${5:-}"
+    local comment="${6:-}"
     
     # 自动检查并初始化nftables环境
     auto_init_if_needed
@@ -286,6 +346,12 @@ create_forward() {
     fi
     
     rule+=" ${protocol} dport ${src_port} dnat to ${dst_ip}:${dst_port}"
+    
+    # 如果提供了注释，格式化并添加到规则中
+    if [[ -n "$comment" ]]; then
+        local formatted_comment=$(format_comment_for_nftables "$comment")
+        rule+=" comment \"$formatted_comment\""
+    fi
     
     # 添加SNAT规则（用于回包）
     local snat_rule="add rule ip ${NFT_TABLE} ${NFT_CHAIN_POSTROUTING} ip daddr ${dst_ip} ${protocol} dport ${dst_port} masquerade"
@@ -371,6 +437,7 @@ modify_forward() {
     local new_dst_ip="$4"
     local new_dst_port="$5"
     local new_interface="${6:-}"
+    local new_comment="${7:-}"
     
     log_info "修改端口转发规则..."
     
@@ -378,7 +445,7 @@ modify_forward() {
     delete_forward "$old_src_port"
     
     # 创建新规则
-    if create_forward "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface"; then
+    if create_forward "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface" "$new_comment"; then
         log_success "端口转发规则修改成功"
     else
         log_error "修改端口转发规则失败"
@@ -498,18 +565,34 @@ interactive_create() {
         interface=$(get_interfaces | sed -n "${interface_choice}p")
     fi
     
+    # 输入注释（可选）
+    echo
+    read -p "请输入规则描述（可选，最多50字符）: " comment_input
+    
+    # 验证注释长度
+    local comment=""
+    if [[ -n "$comment_input" ]]; then
+        if [[ ${#comment_input} -gt 50 ]]; then
+            log_warning "描述超过50字符，将被截断"
+            comment="${comment_input:0:47}..."
+        else
+            comment="$comment_input"
+        fi
+    fi
+    
     echo
     echo "规则预览："
     echo "协议: $protocol"
     echo "源端口: $src_port"
     echo "目标地址: $dst_ip:$dst_port"
     echo "网络接口: ${interface:-"所有接口"}"
+    echo "描述: ${comment:-"无"}"
     echo
     
     read -p "确认创建此规则吗？ [y/N]: " confirm
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        create_forward "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface"
+        create_forward "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface" "$comment"
     else
         log_info "操作已取消"
     fi
@@ -559,10 +642,34 @@ interactive_modify() {
         new_interface=$(get_interfaces | sed -n "${interface_choice}p")
     fi
     
+    # 输入注释（可选）
+    echo
+    read -p "请输入规则描述（可选，最多50字符）: " comment_input
+    
+    # 验证注释长度
+    local comment=""
+    if [[ -n "$comment_input" ]]; then
+        if [[ ${#comment_input} -gt 50 ]]; then
+            log_warning "描述超过50字符，将被截断"
+            comment="${comment_input:0:47}..."
+        else
+            comment="$comment_input"
+        fi
+    fi
+    
+    echo
+    echo "规则预览："
+    echo "协议: $new_protocol"
+    echo "源端口: $new_src_port"
+    echo "目标地址: $new_dst_ip:$new_dst_port"
+    echo "网络接口: ${new_interface:-"所有接口"}"
+    echo "描述: ${comment:-"无"}"
+    echo
+    
     read -p "确认修改规则吗？ [y/N]: " confirm
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        modify_forward "$old_src_port" "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface"
+        modify_forward "$old_src_port" "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface" "$comment"
     else
         log_info "操作已取消"
     fi
@@ -597,13 +704,14 @@ nftables端口转发管理脚本
     -h, --help                     显示帮助信息
 
 非交互式用法:
-    $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface]
+    $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface] [comment]
     $0 delete <src_port> [protocol]
 
 示例:
     $0 --list                                    # 列出所有规则
     $0 create tcp 8080 192.168.1.100 80        # 创建TCP端口转发（自动初始化环境）
     $0 create udp 53 8.8.8.8 53 eth0          # 在eth0接口创建UDP端口转发
+    $0 create tcp 8080 192.168.1.100 80 "" "Web服务器转发"  # 创建带注释的TCP端口转发
     $0 delete 8080 tcp                          # 删除TCP端口8080的转发规则
 
 注意: 
@@ -665,9 +773,9 @@ main() {
             ;;
         create)
             if [[ $# -ge 5 ]]; then
-                create_forward "$2" "$3" "$4" "$5" "${6:-}"
+                create_forward "$2" "$3" "$4" "$5" "${6:-}" "${7:-}"
             else
-                log_error "参数不足。用法: $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface]"
+                log_error "参数不足。用法: $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface] [comment]"
                 exit 1
             fi
             ;;
