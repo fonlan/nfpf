@@ -191,8 +191,8 @@ list_forwards() {
     fi
     
     # 显示表头
-    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "ID" "协议" "源IP(任意)" "源端口" "目标IP" "目标端口" "接口"
-    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "------" "--------" "---------------" "----------" "---------------" "----------" "----------"
+    printf "%-6s %-8s %-17s %-12s %-17s %-12s %-12s\n" "ID" "协议" "源IP(任意)" "源端口" "目标IP" "目标端口" "接口"
+    printf "%-6s %-8s %-17s %-12s %-17s %-12s %-12s\n" "------" "--------" "---------------" "----------" "---------------" "----------" "----------"
     
     # 解析并显示规则
     local rules=$(echo "$rules_output" | grep "dnat to")
@@ -256,7 +256,7 @@ parse_and_display_rule() {
         log_warning "规则解析不完整，显示为未知值"
     fi
     
-    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface"
+    printf "%-6s %-8s %-17s %-12s %-17s %-12s %-12s\n" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface"
 }
 
 
