@@ -437,8 +437,10 @@ delete_forward() {
     if [[ $deleted -gt 0 ]]; then
         log_success "已删除 ${deleted} 条端口转发规则"
         save_config
+        return 0
     else
         log_warning "未找到匹配的端口转发规则"
+        return 1
     fi
 }
 
@@ -478,17 +480,25 @@ modify_forward() {
     fi
     
     # 先删除旧规则
-    delete_forward "$old_src_port"
+    delete_forward "$old_src_port" || true
     
     # 如果需要保留创建时间，格式化新注释
     local final_comment="$new_comment"
     if [[ $preserve_comment_time == true && -n "$new_comment" ]]; then
-        final_comment=$(format_comment_for_nftables "$new_comment" "$old_created_time")
+        # 如果新注释与原有注释相同，直接使用原有注释
+        if [[ -n "$old_comment" && "$new_comment" == "$(echo "$old_comment" | sed 's/^nfpf://; s/|.*$//')" ]]; then
+            final_comment="$old_comment"
+        else
+            final_comment=$(format_comment_for_nftables "$new_comment" "$old_created_time")
+        fi
+    elif [[ -n "$new_comment" ]]; then
+        # 如果不需要保留创建时间，但提供了新注释，格式化新注释
+        final_comment=$(format_comment_for_nftables "$new_comment")
     fi
     
     # 创建新规则
     if create_forward "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface" "$final_comment"; then
-        log_success "端口转发规则修改成功"
+        return 0
     else
         log_error "修改端口转发规则失败"
         return 1
@@ -831,8 +841,8 @@ interactive_modify() {
     case $comment_choice in
         1)
             # 保留原有注释
-            if [[ -n "$RULE_COMMENT" ]]; then
-                comment="$RULE_COMMENT"
+            if [[ -n "$RULE_DESCRIPTION" ]]; then
+                comment="$RULE_DESCRIPTION"
                 log_info "将保留原有注释"
             else
                 log_info "原规则无注释，将不添加注释"
@@ -859,8 +869,8 @@ interactive_modify() {
             ;;
         *)
             log_error "无效选择，将保留原有注释"
-            if [[ -n "$RULE_COMMENT" ]]; then
-                comment="$RULE_COMMENT"
+            if [[ -n "$RULE_DESCRIPTION" ]]; then
+                comment="$RULE_DESCRIPTION"
             fi
             ;;
     esac
@@ -877,9 +887,14 @@ interactive_modify() {
     read -p "确认修改规则吗？ [y/N]: " confirm
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        modify_forward "$old_src_port" "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface" "$comment"
+        if modify_forward "$old_src_port" "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface" "$comment"; then
+            return 0
+        else
+            return 1
+        fi
     else
         log_info "操作已取消"
+        return 0
     fi
 }
 
@@ -1338,6 +1353,8 @@ main() {
             ;;
         -m|--modify)
             interactive_modify
+            read -p "按回车键继续..."
+            show_menu
             ;;
         -s|--save)
             save_config
