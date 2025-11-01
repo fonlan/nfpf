@@ -191,8 +191,8 @@ list_forwards() {
     fi
     
     # 显示表头
-    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s %-25s\n" "ID" "协议" "源IP" "源端口" "目标IP" "目标端口" "接口" "注释"
-    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s %-25s\n" "------" "--------" "---------------" "----------" "---------------" "----------" "----------" "-------------------------"
+    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "ID" "协议" "源IP" "源端口" "目标IP" "目标端口" "接口"
+    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "------" "--------" "---------------" "----------" "---------------" "----------" "----------"
     
     # 解析并显示规则
     local rules=$(echo "$rules_output" | grep "dnat to")
@@ -251,77 +251,14 @@ parse_and_display_rule() {
     local interface=$(echo "$rule" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1)
     [[ -z "$interface" ]] && interface="any"
     
-    # 提取注释信息
-    local comment=$(echo "$rule" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
-    local description=""
-    
-    if [[ -n "$comment" ]]; then
-        # 解析注释格式: "nfpf:描述信息|创建时间|修改时间"
-        if [[ "$comment" =~ ^nfpf:([^|]+) ]]; then
-            description="${BASH_REMATCH[1]}"
-        else
-            description="$comment"
-        fi
-    fi
-    
-    # 如果描述为空，显示为"-"
-    [[ -z "$description" ]] && description="-"
-    
-    # 对长注释进行截断处理，避免表格显示混乱
-    if [[ ${#description} -gt 22 ]]; then
-        description="${description:0:19}..."
-    fi
-    
     # 验证解析结果
     if [[ "$dst_ip" == "unknown" || "$dst_port" == "unknown" ]]; then
         log_warning "规则解析不完整，显示为未知值"
     fi
     
-    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s %-25s\n" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface" "$description"
+    printf "%-6s %-8s %-15s %-10s %-15s %-10s %-10s\n" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface"
 }
 
-# 从规则中提取注释信息
-parse_comment_from_rule() {
-    local rule="$1"
-    
-    # 提取comment部分
-    local comment=$(echo "$rule" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
-    
-    if [[ -n "$comment" ]]; then
-        # 解析注释格式: "nfpf:描述信息|创建时间|修改时间"
-        if [[ "$comment" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
-            local description="${BASH_REMATCH[1]}"
-            local created_time="${BASH_REMATCH[2]}"
-            local modified_time="${BASH_REMATCH[3]}"
-            
-            echo "描述: $description"
-            echo "创建时间: $created_time"
-            echo "修改时间: $modified_time"
-        else
-            echo "注释: $comment"
-        fi
-    else
-        echo "-"
-    fi
-}
-
-# 格式化注释为 nftables 可用格式
-format_comment_for_nftables() {
-    local description="$1"
-    local created_time="${2:-$(date -Iseconds)}"
-    local modified_time="${3:-$(date -Iseconds)}"
-    
-    # 限制描述信息在50字符以内
-    if [[ ${#description} -gt 50 ]]; then
-        description="${description:0:47}..."
-    fi
-    
-    # 清理描述中的特殊字符，避免nftables解析问题
-    description=$(echo "$description" | sed 's/"/\\"/g')
-    
-    # 格式为 "nfpf:描述信息|创建时间|修改时间"
-    echo "nfpf:${description}|${created_time}|${modified_time}"
-}
 
 # 创建端口转发规则
 create_forward() {
@@ -330,7 +267,6 @@ create_forward() {
     local dst_ip="$3"
     local dst_port="$4"
     local interface="${5:-}"
-    local comment="${6:-}"
     
     # 自动检查并初始化nftables环境
     auto_init_if_needed
@@ -359,12 +295,6 @@ create_forward() {
     fi
     
     rule+=" ${protocol} dport ${src_port} dnat to ${dst_ip}:${dst_port}"
-    
-    # 如果提供了注释，格式化并添加到规则中
-    if [[ -n "$comment" ]]; then
-        local formatted_comment=$(format_comment_for_nftables "$comment")
-        rule+=" comment \"$formatted_comment\""
-    fi
     
     # 添加SNAT规则（用于回包）
     local snat_rule="add rule ip ${NFT_TABLE} ${NFT_CHAIN_POSTROUTING} ip daddr ${dst_ip} ${protocol} dport ${dst_port} masquerade"
@@ -418,30 +348,117 @@ delete_forward() {
     
     log_info "删除端口 ${src_port} 的${protocol}转发规则..."
     
-    # 获取规则句柄
-    local handles=$(nft --handle list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                   grep "${protocol} dport ${src_port}" | \
-                   grep -o 'handle [0-9]*' | \
-                   awk '{print $2}')
+    # 获取当前所有规则
+    local current_rules=$(nft list ruleset 2>/dev/null)
     
-    local deleted=0
-    for handle in $handles; do
-        if nft delete rule ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} handle ${handle}; then
-            ((deleted++))
-        fi
-    done
+    # 检查是否存在匹配的规则
+    local has_prerouting_rule=false
+    local has_postrouting_rule=false
     
-    # 删除对应的SNAT规则（这里简化处理，删除所有masquerade规则后重新添加其他的）
-    # 在实际使用中，建议使用更精确的匹配
+    if echo "$current_rules" | grep -q "${protocol} dport ${src_port}.*dnat to"; then
+        has_prerouting_rule=true
+    fi
     
-    if [[ $deleted -gt 0 ]]; then
-        log_success "已删除 ${deleted} 条端口转发规则"
-        save_config
-        return 0
-    else
+    if echo "$current_rules" | grep -q "ip daddr .* ${protocol} dport ${src_port}.*masquerade"; then
+        has_postrouting_rule=true
+    fi
+    
+    if [[ "$has_prerouting_rule" == false && "$has_postrouting_rule" == false ]]; then
         log_warning "未找到匹配的端口转发规则"
         return 1
     fi
+    
+    # 创建临时文件保存当前规则
+    local temp_file=$(mktemp)
+    local new_temp_file=$(mktemp)
+    echo "$current_rules" > "$temp_file"
+    
+    # 创建新的规则集，排除要删除的规则
+    local in_nat_table=false
+    local in_prerouting_chain=false
+    local in_postrouting_chain=false
+    local skip_line=false
+    
+    while IFS= read -r line; do
+        # 跟踪当前所在的位置
+        if [[ "$line" =~ ^[[:space:]]*table[[:space:]]+ip[[:space:]]+nat[[:space:]]*\{ ]]; then
+            in_nat_table=true
+            echo "$line" >> "$new_temp_file"
+            continue
+        fi
+        
+        if [[ "$in_nat_table" == true && "$line" =~ ^[[:space:]]*\} ]]; then
+            in_nat_table=false
+            in_prerouting_chain=false
+            in_postrouting_chain=false
+            echo "$line" >> "$new_temp_file"
+            continue
+        fi
+        
+        if [[ "$in_nat_table" == true && "$line" =~ ^[[:space:]]*chain[[:space:]]+prerouting[[:space:]]*\{ ]]; then
+            in_prerouting_chain=true
+            in_postrouting_chain=false
+            echo "$line" >> "$new_temp_file"
+            continue
+        fi
+        
+        if [[ "$in_prerouting_chain" == true && "$line" =~ ^[[:space:]]*\} ]]; then
+            in_prerouting_chain=false
+            echo "$line" >> "$new_temp_file"
+            continue
+        fi
+        
+        if [[ "$in_nat_table" == true && "$line" =~ ^[[:space:]]*chain[[:space:]]+postrouting[[:space:]]*\{ ]]; then
+            in_postrouting_chain=true
+            in_prerouting_chain=false
+            echo "$line" >> "$new_temp_file"
+            continue
+        fi
+        
+        if [[ "$in_postrouting_chain" == true && "$line" =~ ^[[:space:]]*\} ]]; then
+            in_postrouting_chain=false
+            echo "$line" >> "$new_temp_file"
+            continue
+        fi
+        
+        # 检查是否是要删除的规则
+        skip_line=false
+        if [[ "$in_prerouting_chain" == true ]]; then
+            if [[ "$line" =~ ${protocol}[[:space:]]+dport[[:space:]]+${src_port}.*dnat[[:space:]]+to ]]; then
+                skip_line=true
+                log_info "跳过prerouting规则: $line"
+            fi
+        fi
+        
+        # 修改postrouting规则的匹配条件，使其更准确
+        if [[ "$in_postrouting_chain" == true ]]; then
+            if [[ "$line" =~ ip[[:space:]]+daddr[[:space:]]+.*[[:space:]]+${protocol}[[:space:]]+dport[[:space:]]+${src_port}.*masquerade ]]; then
+                skip_line=true
+                log_info "跳过postrouting规则: $line"
+            fi
+        fi
+        
+        # 如果不是要跳过的行，则添加到新规则集中
+        if [[ "$skip_line" == false ]]; then
+            echo "$line" >> "$new_temp_file"
+        fi
+    done < "$temp_file"
+    
+    # 清理临时文件
+    rm -f "$temp_file"
+    
+    # 清空当前规则集
+    nft flush ruleset
+    
+    # 应用新的规则集
+    nft -f "$new_temp_file"
+    
+    # 清理新临时文件
+    rm -f "$new_temp_file"
+    
+    log_success "已删除端口 ${src_port} 的${protocol}转发规则"
+    save_config
+    return 0
 }
 
 # 修改端口转发规则
@@ -452,52 +469,14 @@ modify_forward() {
     local new_dst_ip="$4"
     local new_dst_port="$5"
     local new_interface="${6:-}"
-    local new_comment="${7:-}"
     
     log_info "修改端口转发规则..."
-    
-    # 获取旧规则的注释信息（如果需要保留创建时间）
-    local old_comment_info=""
-    local old_created_time=""
-    local preserve_comment_time=false
-    
-    # 如果提供了新注释，尝试获取旧注释的创建时间
-    if [[ -n "$new_comment" ]]; then
-        # 获取旧规则信息
-        local old_rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                             grep -E "(tcp|udp)\s+dport\s+${old_src_port}")
-        
-        if [[ -n "$old_rule_info" ]]; then
-            # 提取旧注释信息
-            local old_comment=$(echo "$old_rule_info" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
-            
-            if [[ -n "$old_comment" && "$old_comment" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
-                old_created_time="${BASH_REMATCH[2]}"
-                preserve_comment_time=true
-                log_info "保留原有注释的创建时间: $old_created_time"
-            fi
-        fi
-    fi
     
     # 先删除旧规则
     delete_forward "$old_src_port" || true
     
-    # 如果需要保留创建时间，格式化新注释
-    local final_comment="$new_comment"
-    if [[ $preserve_comment_time == true && -n "$new_comment" ]]; then
-        # 如果新注释与原有注释相同，直接使用原有注释
-        if [[ -n "$old_comment" && "$new_comment" == "$(echo "$old_comment" | sed 's/^nfpf://; s/|.*$//')" ]]; then
-            final_comment="$old_comment"
-        else
-            final_comment=$(format_comment_for_nftables "$new_comment" "$old_created_time")
-        fi
-    elif [[ -n "$new_comment" ]]; then
-        # 如果不需要保留创建时间，但提供了新注释，格式化新注释
-        final_comment=$(format_comment_for_nftables "$new_comment")
-    fi
-    
     # 创建新规则
-    if create_forward "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface" "$final_comment"; then
+    if create_forward "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface"; then
         return 0
     else
         log_error "修改端口转发规则失败"
@@ -613,30 +592,12 @@ extract_rule_info() {
     local rule_interface=$(echo "$rule_info" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1)
     [[ -z "$rule_interface" ]] && rule_interface=""
     
-    # 提取注释
-    local rule_comment=""
-    local rule_description=""
-    local rule_created_time=""
-    local rule_modified_time=""
-    
-    local comment=$(echo "$rule_info" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
-    if [[ -n "$comment" && "$comment" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
-        rule_description="${BASH_REMATCH[1]}"
-        rule_created_time="${BASH_REMATCH[2]}"
-        rule_modified_time="${BASH_REMATCH[3]}"
-        rule_comment="$comment"
-    fi
-    
     # 输出规则信息，使用全局变量返回结果
     RULE_PROTOCOL="$rule_protocol"
     RULE_SRC_PORT="$rule_src_port"
     RULE_DST_IP="$rule_dst_ip"
     RULE_DST_PORT="$rule_dst_port"
     RULE_INTERFACE="$rule_interface"
-    RULE_COMMENT="$rule_comment"
-    RULE_DESCRIPTION="$rule_description"
-    RULE_CREATED_TIME="$rule_created_time"
-    RULE_MODIFIED_TIME="$rule_modified_time"
     
     return 0
 }
@@ -713,34 +674,18 @@ interactive_create() {
         interface=$(get_interfaces | sed -n "${interface_choice}p")
     fi
     
-    # 输入注释（可选）
-    echo
-    read -p "请输入规则描述（可选，最多50字符）: " comment_input
-    
-    # 验证注释长度
-    local comment=""
-    if [[ -n "$comment_input" ]]; then
-        if [[ ${#comment_input} -gt 50 ]]; then
-            log_warning "描述超过50字符，将被截断"
-            comment="${comment_input:0:47}..."
-        else
-            comment="$comment_input"
-        fi
-    fi
-    
     echo
     echo "规则预览："
     echo "协议: $protocol"
     echo "源端口: $src_port"
     echo "目标地址: $dst_ip:$dst_port"
     echo "网络接口: ${interface:-"所有接口"}"
-    echo "描述: ${comment:-"-"}"
     echo
     
     read -p "确认创建此规则吗？ [y/N]: " confirm
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        create_forward "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface" "$comment"
+        create_forward "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface"
     else
         log_info "操作已取消"
     fi
@@ -789,7 +734,6 @@ interactive_modify() {
     echo "目标IP: $RULE_DST_IP"
     echo "目标端口: $RULE_DST_PORT"
     echo "网络接口: ${RULE_INTERFACE:-"所有接口"}"
-    echo "描述: ${RULE_DESCRIPTION:-"-"}"
     echo
     
     echo "请输入新的规则信息（直接按回车保留原值）："
@@ -829,65 +773,18 @@ interactive_modify() {
         fi
     fi
     
-    # 询问是否更新注释
-    echo
-    echo "当前规则描述: ${RULE_DESCRIPTION:-"-"}"
-    echo "1) 保留原有注释"
-    echo "2) 修改注释"
-    echo "3) 删除注释"
-    read -p "请选择 [1-3]: " comment_choice
-    
-    local comment=""
-    case $comment_choice in
-        1)
-            # 保留原有注释
-            if [[ -n "$RULE_DESCRIPTION" ]]; then
-                comment="$RULE_DESCRIPTION"
-                log_info "将保留原有注释"
-            else
-                log_info "原规则无注释，将不添加注释"
-            fi
-            ;;
-        2)
-            # 修改注释
-            local comment_input=$(prompt_with_default "请输入新的规则描述（最多50字符）" "$RULE_DESCRIPTION")
-            
-            # 验证注释长度
-            if [[ -n "$comment_input" ]]; then
-                if [[ ${#comment_input} -gt 50 ]]; then
-                    log_warning "描述超过50字符，将被截断"
-                    comment="${comment_input:0:47}..."
-                else
-                    comment="$comment_input"
-                fi
-            fi
-            ;;
-        3)
-            # 删除注释
-            comment=""
-            log_info "将删除原有注释"
-            ;;
-        *)
-            log_error "无效选择，将保留原有注释"
-            if [[ -n "$RULE_DESCRIPTION" ]]; then
-                comment="$RULE_DESCRIPTION"
-            fi
-            ;;
-    esac
-    
     echo
     echo "规则预览："
     echo "协议: $new_protocol"
     echo "源端口: $new_src_port"
     echo "目标地址: $new_dst_ip:$new_dst_port"
     echo "网络接口: ${new_interface:-"所有接口"}"
-    echo "描述: ${comment:-"-"}"
     echo
     
     read -p "确认修改规则吗？ [y/N]: " confirm
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        if modify_forward "$old_src_port" "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface" "$comment"; then
+        if modify_forward "$old_src_port" "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface"; then
             return 0
         else
             return 1
@@ -898,348 +795,6 @@ interactive_modify() {
     fi
 }
 
-# 注释管理函数
-manage_comment() {
-    local src_port="$1"
-    local protocol="${2:-tcp}"
-    local action="$3"
-    local comment_content="${4:-}"
-    
-    if ! validate_port "$src_port"; then
-        log_error "无效的端口号: $src_port"
-        return 1
-    fi
-    
-    # 获取规则句柄
-    local handles=$(nft --handle list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                   grep "${protocol} dport ${src_port}" | \
-                   grep -o 'handle [0-9]*' | \
-                   awk '{print $2}')
-    
-    if [[ -z "$handles" ]]; then
-        log_error "未找到端口 ${src_port} 的${protocol}转发规则"
-        return 1
-    fi
-    
-    case "$action" in
-        --set)
-            if [[ -z "$comment_content" ]]; then
-                log_error "--set 操作需要提供注释内容"
-                return 1
-            fi
-            
-            # 验证注释长度
-            if [[ ${#comment_content} -gt 50 ]]; then
-                log_warning "注释超过50字符，将被截断"
-                comment_content="${comment_content:0:47}..."
-            fi
-            
-            log_info "设置端口 ${src_port} 的注释..."
-            
-            # 删除旧规则并创建新规则（带注释）
-            local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                             grep "${protocol} dport ${src_port}")
-            
-            # 提取规则信息
-            local dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+:[0-9]+' | sed 's/dnat to //')
-            local dst_ip=$(echo "$dst_info" | cut -d':' -f1 | tr -d ' \t\n\r')
-            local dst_port=$(echo "$dst_info" | cut -d':' -f2 | tr -d ' \t\n\r')
-            local interface=$(echo "$rule_info" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1 | tr -d ' \t\n\r')
-            
-            # 删除旧规则
-            for handle in $handles; do
-                nft delete rule ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} handle ${handle}
-            done
-            
-            # 创建新规则（带注释）
-            create_forward "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface" "$comment_content"
-            ;;
-        --show)
-            log_info "显示端口 ${src_port} 的注释..."
-            
-            # 获取规则并显示注释
-            local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                             grep "${protocol} dport ${src_port}")
-            
-            if [[ -n "$rule_info" ]]; then
-                parse_comment_from_rule "$rule_info"
-            else
-                log_error "未找到匹配的规则"
-                return 1
-            fi
-            ;;
-        --clear)
-            log_info "清除端口 ${src_port} 的注释..."
-            
-            # 获取规则信息
-            local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                             grep "${protocol} dport ${src_port}")
-            
-            # 提取规则信息
-            local dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+:[0-9]+' | sed 's/dnat to //')
-            local dst_ip=$(echo "$dst_info" | cut -d':' -f1 | tr -d ' \t\n\r')
-            local dst_port=$(echo "$dst_info" | cut -d':' -f2 | tr -d ' \t\n\r')
-            local interface=$(echo "$rule_info" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1 | tr -d ' \t\n\r')
-            
-            # 删除旧规则
-            for handle in $handles; do
-                nft delete rule ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} handle ${handle}
-            done
-            
-            # 创建新规则（不带注释）
-            create_forward "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface" ""
-            ;;
-        *)
-            log_error "未知操作: $action"
-            log_info "支持的操作: --set, --show, --clear"
-            return 1
-            ;;
-    esac
-}
-
-# 交互式注释管理
-interactive_manage_comments() {
-    while true; do
-        clear
-        echo "======================================="
-        echo "        规则注释管理工具"
-        echo "======================================="
-        echo
-        echo "1) 添加/修改规则注释"
-        echo "2) 查看规则注释"
-        echo "3) 删除规则注释"
-        echo "4) 查看规则详细信息"
-        echo "0) 返回主菜单"
-        echo
-        read -p "请选择操作 [0-4]: " choice
-        
-        case $choice in
-            1) interactive_set_comment; read -p "按回车键继续...";;
-            2) interactive_show_comment; read -p "按回车键继续...";;
-            3) interactive_clear_comment; read -p "按回车键继续...";;
-            4) interactive_show_rule_details; read -p "按回车键继续...";;
-            0) break ;;
-            *) log_error "无效选择"; sleep 1 ;;
-        esac
-    done
-}
-
-# 交互式设置注释
-interactive_set_comment() {
-    echo
-    list_forwards
-    echo
-    
-    read -p "请输入要设置注释的源端口: " src_port
-    read -p "请输入协议 [tcp/udp，默认tcp]: " protocol
-    protocol=${protocol:-tcp}
-    
-    # 使用新函数提取规则信息
-    if ! extract_rule_info "$src_port" "$protocol"; then
-        log_error "未找到端口 ${src_port} 的${protocol}转发规则"
-        return 1
-    fi
-    
-    echo "当前注释: ${RULE_DESCRIPTION:-"-"}"
-    echo
-    
-    # 使用增强的输入函数，支持显示原值和处理空输入
-    local comment_input=$(prompt_with_default "请输入新的注释内容（最多50字符）" "$RULE_DESCRIPTION")
-    
-    if [[ -z "$comment_input" ]]; then
-        log_warning "注释内容不能为空"
-        return 1
-    fi
-    
-    # 验证注释长度
-    if [[ ${#comment_input} -gt 50 ]]; then
-        log_warning "注释超过50字符，将被截断"
-        comment_input="${comment_input:0:47}..."
-    fi
-    
-    echo
-    read -p "确认设置注释吗？ [y/N]: " confirm
-    
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        manage_comment "$src_port" "$protocol" --set "$comment_input"
-    else
-        log_info "操作已取消"
-    fi
-}
-
-# 交互式查看注释
-interactive_show_comment() {
-    echo
-    list_forwards
-    echo
-    
-    read -p "请输入要查看注释的源端口: " src_port
-    read -p "请输入协议 [tcp/udp，默认tcp]: " protocol
-    protocol=${protocol:-tcp}
-    
-    # 获取规则信息
-    local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                     grep "${protocol} dport ${src_port}")
-    
-    if [[ -z "$rule_info" ]]; then
-        log_error "未找到端口 ${src_port} 的${protocol}转发规则"
-        return 1
-    fi
-    
-    echo
-    echo "======================================="
-    echo "           规则注释信息"
-    echo "======================================="
-    echo
-    
-    # 显示基本信息
-    echo "协议: $protocol"
-    echo "源端口: $src_port"
-    echo
-    
-    # 显示注释信息
-    echo "---------------------------------------"
-    echo "            注释信息"
-    echo "---------------------------------------"
-    
-    # 提取注释信息
-    local comment=$(echo "$rule_info" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
-    
-    if [[ -n "$comment" ]]; then
-        # 解析注释格式: "nfpf:描述信息|创建时间|修改时间"
-        if [[ "$comment" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
-            local description="${BASH_REMATCH[1]}"
-            local created_time="${BASH_REMATCH[2]}"
-            local modified_time="${BASH_REMATCH[3]}"
-            
-            echo "描述: $description"
-            echo "创建时间: $created_time"
-            echo "修改时间: $modified_time"
-        else
-            echo "注释: $comment"
-        fi
-    else
-        echo "-"
-    fi
-    echo
-}
-
-# 交互式清除注释
-interactive_clear_comment() {
-    echo
-    list_forwards
-    echo
-    
-    read -p "请输入要清除注释的源端口: " src_port
-    read -p "请输入协议 [tcp/udp，默认tcp]: " protocol
-    protocol=${protocol:-tcp}
-    
-    # 使用新函数提取规则信息
-    if ! extract_rule_info "$src_port" "$protocol"; then
-        log_error "未找到端口 ${src_port} 的${protocol}转发规则"
-        return 1
-    fi
-    
-    echo "当前注释: ${RULE_DESCRIPTION:-"-"}"
-    echo
-    read -p "确认清除注释吗？ [y/N]: " confirm
-    
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        manage_comment "$src_port" "$protocol" --clear
-    else
-        log_info "操作已取消"
-    fi
-}
-
-# 交互式显示规则详细信息
-interactive_show_rule_details() {
-    echo
-    list_forwards
-    echo
-    
-    read -p "请输入要查看详细信息的源端口: " src_port
-    read -p "请输入协议 [tcp/udp，默认tcp]: " protocol
-    protocol=${protocol:-tcp}
-    
-    # 获取规则信息
-    local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                     grep "${protocol} dport ${src_port}")
-    
-    if [[ -z "$rule_info" ]]; then
-        log_error "未找到端口 ${src_port} 的${protocol}转发规则"
-        return 1
-    fi
-    
-    echo
-    echo "======================================="
-    echo "           规则详细信息"
-    echo "======================================="
-    echo
-    
-    # 解析规则信息
-    local protocol=$(echo "$rule_info" | grep -oE '\b(tcp|udp)\b' | head -1)
-    [[ -z "$protocol" ]] && protocol="tcp"
-    
-    local src_port=$(echo "$rule_info" | grep -oE 'dport\s+[0-9]+' | awk '{print $2}' | head -1)
-    
-    local dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+:[0-9]+' | sed 's/dnat to //')
-    if [[ -n "$dst_info" ]]; then
-        local dst_ip=$(echo "$dst_info" | cut -d':' -f1)
-        local dst_port=$(echo "$dst_info" | cut -d':' -f2)
-    else
-        dst_ip="unknown"
-        dst_port="unknown"
-    fi
-    
-    local interface=$(echo "$rule_info" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1)
-    [[ -z "$interface" ]] && interface="any"
-    
-    # 显示基本信息
-    echo "协议: $protocol"
-    echo "源端口: $src_port"
-    echo "目标地址: $dst_ip:$dst_port"
-    echo "网络接口: ${interface:-"所有接口"}"
-    echo
-    
-    # 显示注释信息
-    echo "---------------------------------------"
-    echo "            注释信息"
-    echo "---------------------------------------"
-    
-    # 提取注释信息
-    local comment=$(echo "$rule_info" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
-    
-    if [[ -n "$comment" ]]; then
-        # 解析注释格式: "nfpf:描述信息|创建时间|修改时间"
-        if [[ "$comment" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
-            local description="${BASH_REMATCH[1]}"
-            local created_time="${BASH_REMATCH[2]}"
-            local modified_time="${BASH_REMATCH[3]}"
-            
-            echo "描述: $description"
-            echo "创建时间: $created_time"
-            echo "修改时间: $modified_time"
-        else
-            echo "注释: $comment"
-        fi
-    else
-        echo "-"
-    fi
-    echo
-    
-    # 显示规则句柄
-    local handle=$(echo "$rule_info" | grep -o 'handle [0-9]*' | awk '{print $2}')
-    if [[ -n "$handle" ]]; then
-        echo "规则句柄: $handle"
-    fi
-    
-    # 显示原始规则
-    echo
-    echo "---------------------------------------"
-    echo "           原始规则"
-    echo "---------------------------------------"
-    echo "$rule_info"
-}
 
 # 启用IP转发
 enable_ip_forward() {
@@ -1270,40 +825,24 @@ nftables端口转发管理脚本
     -h, --help                     显示帮助信息
 
 非交互式用法:
-    $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface] [--comment "注释"]
+    $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface]
     $0 delete <src_port> [protocol]
-    $0 comment <src_port> [protocol] --set "注释内容"  # 设置注释
-    $0 comment <src_port> [protocol] --show           # 显示注释
-    $0 comment <src_port> [protocol] --clear          # 清除注释
 
 示例:
     $0 --list                                    # 列出所有规则
     $0 create tcp 8080 192.168.1.100 80        # 创建TCP端口转发（自动初始化环境）
     $0 create udp 53 8.8.8.8 53 eth0          # 在eth0接口创建UDP端口转发
-    $0 create tcp 8080 192.168.1.100 80 --comment "Web服务器转发"  # 创建带注释的TCP端口转发
     $0 delete 8080 tcp                          # 删除TCP端口8080的转发规则
-    $0 comment 8080 tcp --set "更新后的注释"     # 设置端口8080的注释
-    $0 comment 8080 tcp --show                  # 显示端口8080的注释
-    $0 comment 8080 tcp --clear                 # 清除端口8080的注释
-
-注释管理功能:
-    - 支持为规则添加描述性注释，最多50个字符
-    - 注释包含创建时间和修改时间信息
-    - 可以单独修改规则注释而不修改其他参数
-    - 支持查看规则的详细信息和完整注释内容
 
 规则修改功能:
     - 修改规则时支持直接按回车保留原值
     - 显示当前规则的所有参数作为默认值
     - 支持选择性修改规则中的任意参数
-    - 修改注释时也支持直接按回车保留原值
 
 注意:
     - 此脚本需要root权限运行
     - 首次创建端口转发时会自动初始化nftables环境
-    - 注释内容最多支持50个字符
-    - 修改规则时会保留原有注释的创建时间，更新修改时间
-    - 在修改规则或注释时，直接按回车键将保留原有值
+    - 在修改规则时，直接按回车键将保留原有值
 EOF
 }
 
@@ -1318,19 +857,15 @@ show_menu() {
     echo "2) 创建端口转发规则"
     echo "3) 删除端口转发规则"
     echo "4) 修改端口转发规则"
-    echo "5) 管理规则注释"
-    echo "6) 保存配置"
     echo "0) 退出"
     echo
-    read -p "请选择操作 [0-6]: " choice
+    read -p "请选择操作 [0-4]: " choice
     
     case $choice in
         1) list_forwards; read -p "按回车键继续..."; show_menu ;;
         2) interactive_create; read -p "按回车键继续..."; show_menu ;;
         3) interactive_delete; read -p "按回车键继续..."; show_menu ;;
         4) interactive_modify; read -p "按回车键继续..."; show_menu ;;
-        5) interactive_manage_comments; show_menu ;;
-        6) save_config; read -p "按回车键继续..."; show_menu ;;
         0) log_info "退出程序"; exit 0 ;;
         *) log_error "无效选择"; sleep 1; show_menu ;;
     esac
@@ -1363,82 +898,25 @@ main() {
             show_help
             ;;
         create)
-            # 解析 create 命令的参数，支持 --comment 选项
-            local protocol=""
-            local src_port=""
-            local dst_ip=""
-            local dst_port=""
-            local interface=""
-            local comment=""
-            local i=2
-            
             # 必需参数
-            if [[ $# -lt 6 ]]; then
-                log_error "参数不足。用法: $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface] [--comment \"注释\"]"
+            if [[ $# -lt 5 ]]; then
+                log_error "参数不足。用法: $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface]"
                 exit 1
             fi
             
-            protocol="$2"
-            src_port="$3"
-            dst_ip="$4"
-            dst_port="$5"
+            local protocol="$2"
+            local src_port="$3"
+            local dst_ip="$4"
+            local dst_port="$5"
+            local interface="${6:-}"
             
-            # 处理可选参数
-            shift 5  # 移除前5个参数，保留可选参数
-            while [[ $# -gt 0 ]]; do
-                case "$1" in
-                    --comment)
-                        if [[ -n "$2" ]]; then
-                            comment="$2"
-                            shift 2
-                        else
-                            log_error "--comment 参数需要提供注释内容"
-                            exit 1
-                        fi
-                        ;;
-                    *)
-                        # 如果不是 --comment，则认为是 interface 参数
-                        if [[ -z "$interface" ]]; then
-                            interface="$1"
-                        else
-                            log_error "未知参数: $1"
-                            exit 1
-                        fi
-                        shift
-                        ;;
-                esac
-            done
-            
-            create_forward "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface" "$comment"
+            create_forward "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface"
             ;;
         delete)
             if [[ $# -ge 2 ]]; then
                 delete_forward "$2" "${3:-tcp}"
             else
                 log_error "参数不足。用法: $0 delete <src_port> [protocol]"
-                exit 1
-            fi
-            ;;
-        comment)
-            if [[ $# -ge 4 ]]; then
-                local src_port="$2"
-                local protocol="${3:-tcp}"
-                local action="$4"
-                local comment_content=""
-                
-                # 检查是否是 --set 操作，需要额外的注释内容参数
-                if [[ "$action" == "--set" ]]; then
-                    if [[ $# -ge 5 ]]; then
-                        comment_content="$5"
-                    else
-                        log_error "--set 操作需要提供注释内容"
-                        exit 1
-                    fi
-                fi
-                
-                manage_comment "$src_port" "$protocol" "$action" "$comment_content"
-            else
-                log_error "参数不足。用法: $0 comment <src_port> [protocol] --set \"注释内容\" | --show | --clear"
                 exit 1
             fi
             ;;
