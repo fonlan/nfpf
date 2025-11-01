@@ -3,7 +3,15 @@
 # nftables端口转发管理脚本
 # 适用于Debian系Linux发行版
 # 作者: fonlan
-# 版本: 1.0
+# 版本: 1.1
+#
+# 更新日志:
+# v1.1 - 添加修改端口转发规则时支持直接按回车使用原值的功能
+#       - 新增 extract_rule_info() 函数，用于提取规则的完整信息
+#       - 新增 prompt_with_default() 函数，支持显示原值和处理空输入
+#       - 修改 interactive_modify() 函数，支持在修改规则时直接按回车保留原值
+#       - 修改 interactive_set_comment() 函数，支持在设置注释时直接按回车保留原值
+#       - 修改 interactive_clear_comment() 函数，使用统一的规则信息提取方式
 
 set -euo pipefail
 
@@ -547,6 +555,102 @@ refresh_nftables_state() {
     # log_success "nftables状态已刷新"
 }
 
+# 提取规则的完整信息
+extract_rule_info() {
+    local src_port="$1"
+    local protocol="${2:-tcp}"
+    
+    # 获取规则信息
+    local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
+                     grep "${protocol} dport ${src_port}")
+    
+    if [[ -z "$rule_info" ]]; then
+        return 1
+    fi
+    
+    # 提取协议
+    local rule_protocol=$(echo "$rule_info" | grep -oE '\b(tcp|udp)\b' | head -1)
+    [[ -z "$rule_protocol" ]] && rule_protocol="tcp"
+    
+    # 提取源端口
+    local rule_src_port=$(echo "$rule_info" | grep -oE 'dport\s+[0-9]+' | awk '{print $2}' | head -1)
+    
+    # 提取目标信息
+    local dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+:[0-9]+' | sed 's/dnat to //')
+    if [[ -n "$dst_info" ]]; then
+        local rule_dst_ip=$(echo "$dst_info" | cut -d':' -f1)
+        local rule_dst_port=$(echo "$dst_info" | cut -d':' -f2)
+    else
+        # 尝试另一种格式
+        dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+\s+[0-9]+' | sed 's/dnat to /:/')
+        if [[ -n "$dst_info" ]]; then
+            rule_dst_ip=$(echo "$dst_info" | cut -d':' -f1)
+            rule_dst_port=$(echo "$dst_info" | cut -d':' -f2)
+        else
+            # 尝试第三种格式（不带冒号）
+            dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+' | sed 's/dnat to //')
+            if [[ -n "$dst_info" ]]; then
+                rule_dst_ip="$dst_info"
+                rule_dst_port="$rule_src_port"  # 假设目标端口与源端口相同
+            else
+                rule_dst_ip="unknown"
+                rule_dst_port="unknown"
+            fi
+        fi
+    fi
+    
+    # 提取接口
+    local rule_interface=$(echo "$rule_info" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1)
+    [[ -z "$rule_interface" ]] && rule_interface=""
+    
+    # 提取注释
+    local rule_comment=""
+    local rule_description=""
+    local rule_created_time=""
+    local rule_modified_time=""
+    
+    local comment=$(echo "$rule_info" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
+    if [[ -n "$comment" && "$comment" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
+        rule_description="${BASH_REMATCH[1]}"
+        rule_created_time="${BASH_REMATCH[2]}"
+        rule_modified_time="${BASH_REMATCH[3]}"
+        rule_comment="$comment"
+    fi
+    
+    # 输出规则信息，使用全局变量返回结果
+    RULE_PROTOCOL="$rule_protocol"
+    RULE_SRC_PORT="$rule_src_port"
+    RULE_DST_IP="$rule_dst_ip"
+    RULE_DST_PORT="$rule_dst_port"
+    RULE_INTERFACE="$rule_interface"
+    RULE_COMMENT="$rule_comment"
+    RULE_DESCRIPTION="$rule_description"
+    RULE_CREATED_TIME="$rule_created_time"
+    RULE_MODIFIED_TIME="$rule_modified_time"
+    
+    return 0
+}
+
+# 增强的输入函数，支持显示原值和处理空输入
+prompt_with_default() {
+    local prompt="$1"
+    local default_value="$2"
+    local result=""
+    
+    # 如果有默认值，在提示中显示
+    if [[ -n "$default_value" ]]; then
+        read -p "$prompt [默认: $default_value]: " result
+        # 如果用户直接按回车，使用默认值
+        if [[ -z "$result" ]]; then
+            result="$default_value"
+        fi
+    else
+        read -p "$prompt: " result
+    fi
+    
+    echo "$result"
+}
+
 # 保存配置
 save_config() {
     log_info "保存nftables配置..."
@@ -658,41 +762,66 @@ interactive_modify() {
     echo
     
     read -p "请输入要修改的源端口: " old_src_port
+    read -p "请输入协议 [tcp/udp，默认tcp]: " protocol
+    protocol=${protocol:-tcp}
     
-    # 获取旧规则信息，用于显示当前注释
-    local old_rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                         grep -E "(tcp|udp)\s+dport\s+${old_src_port}")
-    
-    local old_comment=""
-    local old_description="-"
-    if [[ -n "$old_rule_info" ]]; then
-        local old_comment_full=$(echo "$old_rule_info" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
-        if [[ -n "$old_comment_full" && "$old_comment_full" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
-            old_description="${BASH_REMATCH[1]}"
-            old_comment="$old_comment_full"
-        fi
+    # 使用新函数提取规则信息
+    if ! extract_rule_info "$old_src_port" "$protocol"; then
+        log_error "未找到端口 ${old_src_port} 的${protocol}转发规则"
+        return 1
     fi
     
-    echo "请输入新的规则信息："
-    read -p "协议 [tcp/udp]: " new_protocol
-    read -p "新源端口: " new_src_port
-    read -p "新目标IP: " new_dst_ip
-    read -p "新目标端口: " new_dst_port
+    # 显示当前规则信息
+    echo
+    echo "当前规则信息："
+    echo "协议: $RULE_PROTOCOL"
+    echo "源端口: $RULE_SRC_PORT"
+    echo "目标IP: $RULE_DST_IP"
+    echo "目标端口: $RULE_DST_PORT"
+    echo "网络接口: ${RULE_INTERFACE:-"所有接口"}"
+    echo "描述: ${RULE_DESCRIPTION:-"-"}"
+    echo
     
+    echo "请输入新的规则信息（直接按回车保留原值）："
+    
+    # 使用增强的输入函数，支持显示原值和处理空输入
+    local new_protocol=$(prompt_with_default "协议 [tcp/udp]" "$RULE_PROTOCOL")
+    local new_src_port=$(prompt_with_default "源端口" "$RULE_SRC_PORT")
+    local new_dst_ip=$(prompt_with_default "目标IP" "$RULE_DST_IP")
+    local new_dst_port=$(prompt_with_default "目标端口" "$RULE_DST_PORT")
+    
+    # 处理网络接口选择
     echo
     echo "可用的网络接口："
     get_interfaces | nl
+    echo "0) 所有接口（不指定）"
     echo
-    read -p "请选择网络接口编号（回车跳过）: " interface_choice
+    
+    # 如果原规则有接口，尝试找到它的编号
+    local interface_choice=""
+    if [[ -n "$RULE_INTERFACE" ]]; then
+        local interface_num=$(get_interfaces | grep -n "^$RULE_INTERFACE$" | cut -d':' -f1)
+        if [[ -n "$interface_num" ]]; then
+            interface_choice=$(prompt_with_default "请选择网络接口编号" "$interface_num")
+        else
+            interface_choice=$(prompt_with_default "请选择网络接口编号" "0")
+        fi
+    else
+        interface_choice=$(prompt_with_default "请选择网络接口编号" "0")
+    fi
     
     local new_interface=""
     if [[ -n "$interface_choice" && "$interface_choice" =~ ^[0-9]+$ ]]; then
-        new_interface=$(get_interfaces | sed -n "${interface_choice}p")
+        if [[ "$interface_choice" == "0" ]]; then
+            new_interface=""
+        else
+            new_interface=$(get_interfaces | sed -n "${interface_choice}p")
+        fi
     fi
     
     # 询问是否更新注释
     echo
-    echo "当前规则描述: $old_description"
+    echo "当前规则描述: ${RULE_DESCRIPTION:-"-"}"
     echo "1) 保留原有注释"
     echo "2) 修改注释"
     echo "3) 删除注释"
@@ -702,8 +831,8 @@ interactive_modify() {
     case $comment_choice in
         1)
             # 保留原有注释
-            if [[ -n "$old_comment" ]]; then
-                comment="$old_comment"
+            if [[ -n "$RULE_COMMENT" ]]; then
+                comment="$RULE_COMMENT"
                 log_info "将保留原有注释"
             else
                 log_info "原规则无注释，将不添加注释"
@@ -711,7 +840,7 @@ interactive_modify() {
             ;;
         2)
             # 修改注释
-            read -p "请输入新的规则描述（可选，最多50字符）: " comment_input
+            local comment_input=$(prompt_with_default "请输入新的规则描述（最多50字符）" "$RULE_DESCRIPTION")
             
             # 验证注释长度
             if [[ -n "$comment_input" ]]; then
@@ -730,8 +859,8 @@ interactive_modify() {
             ;;
         *)
             log_error "无效选择，将保留原有注释"
-            if [[ -n "$old_comment" ]]; then
-                comment="$old_comment"
+            if [[ -n "$RULE_COMMENT" ]]; then
+                comment="$RULE_COMMENT"
             fi
             ;;
     esac
@@ -890,21 +1019,17 @@ interactive_set_comment() {
     read -p "请输入协议 [tcp/udp，默认tcp]: " protocol
     protocol=${protocol:-tcp}
     
-    # 获取当前注释
-    local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                     grep "${protocol} dport ${src_port}")
-    
-    local current_description="-"
-    if [[ -n "$rule_info" ]]; then
-        local comment=$(echo "$rule_info" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
-        if [[ -n "$comment" && "$comment" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
-            current_description="${BASH_REMATCH[1]}"
-        fi
+    # 使用新函数提取规则信息
+    if ! extract_rule_info "$src_port" "$protocol"; then
+        log_error "未找到端口 ${src_port} 的${protocol}转发规则"
+        return 1
     fi
     
-    echo "当前注释: $current_description"
+    echo "当前注释: ${RULE_DESCRIPTION:-"-"}"
     echo
-    read -p "请输入新的注释内容（最多50字符）: " comment_input
+    
+    # 使用增强的输入函数，支持显示原值和处理空输入
+    local comment_input=$(prompt_with_default "请输入新的注释内容（最多50字符）" "$RULE_DESCRIPTION")
     
     if [[ -z "$comment_input" ]]; then
         log_warning "注释内容不能为空"
@@ -994,19 +1119,13 @@ interactive_clear_comment() {
     read -p "请输入协议 [tcp/udp，默认tcp]: " protocol
     protocol=${protocol:-tcp}
     
-    # 获取当前注释
-    local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                     grep "${protocol} dport ${src_port}")
-    
-    local current_description="-"
-    if [[ -n "$rule_info" ]]; then
-        local comment=$(echo "$rule_info" | grep -oE 'comment\s+"[^"]*"' | sed 's/comment "//; s/"//')
-        if [[ -n "$comment" && "$comment" =~ ^nfpf:(.+)\|(.+)\|(.+)$ ]]; then
-            current_description="${BASH_REMATCH[1]}"
-        fi
+    # 使用新函数提取规则信息
+    if ! extract_rule_info "$src_port" "$protocol"; then
+        log_error "未找到端口 ${src_port} 的${protocol}转发规则"
+        return 1
     fi
     
-    echo "当前注释: $current_description"
+    echo "当前注释: ${RULE_DESCRIPTION:-"-"}"
     echo
     read -p "确认清除注释吗？ [y/N]: " confirm
     
@@ -1158,11 +1277,18 @@ nftables端口转发管理脚本
     - 可以单独修改规则注释而不修改其他参数
     - 支持查看规则的详细信息和完整注释内容
 
+规则修改功能:
+    - 修改规则时支持直接按回车保留原值
+    - 显示当前规则的所有参数作为默认值
+    - 支持选择性修改规则中的任意参数
+    - 修改注释时也支持直接按回车保留原值
+
 注意:
     - 此脚本需要root权限运行
     - 首次创建端口转发时会自动初始化nftables环境
     - 注释内容最多支持50个字符
     - 修改规则时会保留原有注释的创建时间，更新修改时间
+    - 在修改规则或注释时，直接按回车键将保留原有值
 EOF
 }
 
