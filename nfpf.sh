@@ -44,6 +44,54 @@ log_warning() {
 log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
+# 统一表格打印函数
+print_table_row() {
+    local row_type="$1"
+    shift
+    
+    # 定义表格格式
+    local format="%-6s %-8s %-17s %-12s %-17s %-12s %-12s %-20s\n"
+    
+    # 根据行类型处理
+    case "$row_type" in
+        "header")
+            printf "$format" "ID" "协议" "  源IP(任意)" "     源端口" "      目标IP" "        目标端口" "    接口" "      注释"
+            ;;
+        "separator")
+            printf "$format" "------" "--------" "---------------" "----------" "---------------" "----------" "----------" "--------------------"
+            ;;
+        "data")
+            # 确保有8个参数
+            if [[ $# -ne 8 ]]; then
+                log_error "数据行需要8个参数，但提供了 $# 个"
+                return 1
+            fi
+            
+            local id="$1"
+            local protocol="$2"
+            local src_ip="$3"
+            local src_port="$4"
+            local dst_ip="$5"
+            local dst_port="$6"
+            local interface="$7"
+            local comment="$8"
+            
+            # 处理注释长度限制
+            if [[ ${#comment} -gt 20 ]]; then
+                comment="${comment:0:17}..."
+            fi
+            
+            printf "$format" "$id" "$protocol" "$src_ip" "$src_port" "$dst_ip" "$dst_port" "$interface" "$comment"
+            ;;
+        *)
+            log_error "未知的行类型: $row_type"
+            return 1
+            ;;
+    esac
+    
+    return 0
+}
+
 
 # 检查权限
 check_root() {
@@ -211,8 +259,8 @@ list_forwards() {
     fi
     
     # 显示表头
-    printf "%-6s %-8s %-17s %-12s %-17s %-12s %-12s %-20s\n" "ID" "协议" "源IP(任意)" "源端口" "目标IP" "目标端口" "接口" "注释"
-    printf "%-6s %-8s %-17s %-12s %-17s %-12s %-12s %-20s\n" "------" "--------" "---------------" "----------" "---------------" "----------" "----------" "--------------------"
+    print_table_row "header"
+    print_table_row "separator"
     
     # 解析并显示规则
     local rules=$(echo "$rules_output" | grep "dnat to")
@@ -285,7 +333,7 @@ parse_and_display_rule() {
         log_warning "规则解析不完整，显示为未知值"
     fi
     
-    printf "%-6s %-8s %-17s %-12s %-17s %-12s %-12s %-20s\n" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface" "$comment"
+    print_table_row "data" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface" "$comment"
 }
 
 # 获取所有规则并构建ID映射
@@ -885,6 +933,31 @@ interactive_delete() {
     fi
 }
 
+# 验证规则ID
+validate_rule_id() {
+    local rule_id="$1"
+    
+    # 验证ID是否为数字
+    if [[ ! "$rule_id" =~ ^[0-9]+$ ]]; then
+        log_error "规则ID必须是数字"
+        return 1
+    fi
+    
+    # 构建ID映射
+    if ! build_rule_id_map; then
+        log_error "无法获取规则列表或没有规则存在"
+        return 1
+    fi
+    
+    # 检查ID是否存在
+    if [[ -z "${RULE_ID_MAP[$rule_id]:-}" ]]; then
+        log_error "规则ID $rule_id 不存在"
+        return 1
+    fi
+    
+    return 0
+}
+
 # 交互式修改端口转发
 interactive_modify() {
     echo
@@ -899,13 +972,45 @@ interactive_modify() {
     
     echo
     
-    read -p "请输入要修改的源端口: " old_src_port
-    read -p "请输入协议 [tcp/udp，默认tcp]: " protocol
-    protocol=${protocol:-tcp}
+    # 添加提示信息
+    echo "请记下要修改规则的ID（第一列）"
+    echo
     
-    # 使用新函数提取规则信息
-    if ! extract_rule_info "$old_src_port" "$protocol"; then
-        log_error "未找到端口 ${old_src_port} 的${protocol}转发规则"
+    # 添加输入重试机制（最多3次尝试）
+    local max_attempts=3
+    local attempt=1
+    local rule_id=""
+    local valid_input=false
+    
+    while [[ $attempt -le $max_attempts && $valid_input == false ]]; do
+        read -p "请输入要修改的规则ID（输入q退出）: " rule_id
+        
+        # 检查是否要退出
+        if [[ "$rule_id" == "q" || "$rule_id" == "Q" ]]; then
+            log_info "操作已取消"
+            return 0
+        fi
+        
+        # 验证规则ID
+        if validate_rule_id "$rule_id"; then
+            valid_input=true
+        else
+            ((attempt++))
+            if [[ $attempt -le $max_attempts ]]; then
+                log_warning "输入无效，请重试（剩余尝试次数: $((max_attempts - attempt + 1))）"
+            fi
+        fi
+    done
+    
+    # 如果所有尝试都失败，退出
+    if [[ $valid_input == false ]]; then
+        log_error "输入错误次数过多，操作已取消"
+        return 1
+    fi
+    
+    # 使用规则ID提取规则信息
+    if ! extract_rule_info "$rule_id"; then
+        log_error "无法获取规则ID $rule_id 的详细信息"
         return 1
     fi
     
@@ -970,7 +1075,7 @@ interactive_modify() {
     read -p "确认修改规则吗？ [y/N]: " confirm
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        if modify_forward "$old_src_port" "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface" "$new_comment"; then
+        if modify_forward "$RULE_SRC_PORT" "$new_protocol" "$new_src_port" "$new_dst_ip" "$new_dst_port" "$new_interface" "$new_comment"; then
             return 0
         else
             return 1
@@ -1065,4 +1170,7 @@ main() {
 }
 
 # 脚本入口
-main "$@"
+# 只有在没有设置SKIP_MAIN变量时才执行main函数
+if [[ "${SKIP_MAIN:-}" != "1" ]]; then
+    main "$@"
+fi
