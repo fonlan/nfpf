@@ -200,34 +200,13 @@ list_forwards() {
     # 强制刷新nftables状态，确保获取最新规则
     refresh_nftables_state
     
-    # 添加重试机制，最多重试3次
-    local max_attempts=3
-    local attempt=1
-    local rules_output=""
+    # 获取规则列表（仅执行一次）
+    local rules_output=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null)
     
-    while [[ $attempt -le $max_attempts ]]; do
-        # log_info "尝试获取规则列表 (第 $attempt 次)..."
-        
-        # 检查是否存在规则
-        rules_output=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null)
-        
-        if echo "$rules_output" | grep -q "dnat to"; then
-            # log_success "成功获取到规则列表"
-            break
-        else
-            log_warning "第 $attempt 次尝试未找到规则，等待后重试..."
-            if [[ $attempt -lt $max_attempts ]]; then
-                sleep 1
-                refresh_nftables_state
-            fi
-        fi
-        
-        ((attempt++))
-    done
-    
-    # 如果所有尝试都失败
+    # 如果没有找到规则
     if ! echo "$rules_output" | grep -q "dnat to"; then
-        log_warning "经过 $max_attempts 次尝试后，仍未找到任何端口转发规则"
+        log_warning "没有找到端口转发规则"
+        log_info "请先创建端口转发规则，然后返回主菜单"
         return 0
     fi
     
@@ -309,6 +288,89 @@ parse_and_display_rule() {
     printf "%-6s %-8s %-17s %-12s %-17s %-12s %-12s %-20s\n" "$id" "$protocol" "any" "$src_port" "$dst_ip" "$dst_port" "$interface" "$comment"
 }
 
+# 获取所有规则并构建ID映射
+build_rule_id_map() {
+    # 如果环境未初始化，返回空映射
+    if ! check_nftables_initialized; then
+        return 1
+    fi
+    
+    # 强制刷新nftables状态，确保获取最新规则
+    refresh_nftables_state
+    
+    # 获取规则列表
+    local rules_output=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null)
+    
+    # 检查是否存在规则
+    if ! echo "$rules_output" | grep -q "dnat to"; then
+        return 1
+    fi
+    
+    # 解析规则并构建ID映射
+    local rules=$(echo "$rules_output" | grep "dnat to")
+    local counter=1
+    
+    # 清空关联数组
+    unset RULE_ID_MAP
+    declare -gA RULE_ID_MAP
+    
+    # 使用更可靠的方式处理规则
+    if [[ -n "$rules" ]]; then
+        while IFS= read -r rule; do
+            if [[ -n "$rule" ]]; then
+                # 提取规则的关键信息作为映射值
+                local protocol=$(echo "$rule" | grep -oE '\b(tcp|udp)\b' | head -1)
+                [[ -z "$protocol" ]] && protocol="tcp"
+                
+                local src_port=$(echo "$rule" | grep -oE 'dport\s+[0-9]+' | awk '{print $2}' | head -1)
+                [[ -z "$src_port" ]] && src_port="any"
+                
+                # 使用协议和源端口作为唯一标识
+                local key="${protocol}:${src_port}"
+                RULE_ID_MAP["$counter"]="$key"
+                ((counter++))
+            fi
+        done <<< "$rules"
+    fi
+    
+    return 0
+}
+
+# 通过ID获取规则信息
+get_rule_by_id() {
+    local rule_id="$1"
+    
+    # 验证ID是否为数字
+    if [[ ! "$rule_id" =~ ^[0-9]+$ ]]; then
+        log_error "无效的规则ID: $rule_id"
+        return 1
+    fi
+    
+    # 构建ID映射
+    if ! build_rule_id_map; then
+        log_error "无法获取规则列表或没有规则存在"
+        return 1
+    fi
+    
+    # 检查ID是否存在
+    if [[ -z "${RULE_ID_MAP[$rule_id]:-}" ]]; then
+        log_error "规则ID $rule_id 不存在"
+        return 1
+    fi
+    
+    # 从映射中获取协议和源端口
+    local rule_key="${RULE_ID_MAP[$rule_id]}"
+    local protocol="${rule_key%:*}"
+    local src_port="${rule_key#*:}"
+    
+    # 使用现有的extract_rule_info函数获取完整规则信息
+    if extract_rule_info "$src_port" "$protocol"; then
+        return 0
+    else
+        log_error "无法获取规则ID $rule_id 的详细信息"
+        return 1
+    fi
+}
 
 # 创建端口转发规则
 create_forward() {
@@ -624,65 +686,82 @@ refresh_nftables_state() {
 
 # 提取规则的完整信息
 extract_rule_info() {
-    local src_port="$1"
-    local protocol="${2:-tcp}"
+    local param1="$1"
+    local param2="${2:-}"
     
-    # 获取规则信息
-    local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
-                     grep "${protocol} dport ${src_port}")
+    local src_port=""
+    local protocol="tcp"
     
-    if [[ -z "$rule_info" ]]; then
-        return 1
-    fi
-    
-    # 提取协议
-    local rule_protocol=$(echo "$rule_info" | grep -oE '\b(tcp|udp)\b' | head -1)
-    [[ -z "$rule_protocol" ]] && rule_protocol="tcp"
-    
-    # 提取源端口
-    local rule_src_port=$(echo "$rule_info" | grep -oE 'dport\s+[0-9]+' | awk '{print $2}' | head -1)
-    
-    # 提取目标信息
-    local dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+:[0-9]+' | sed 's/dnat to //')
-    if [[ -n "$dst_info" ]]; then
-        local rule_dst_ip=$(echo "$dst_info" | cut -d':' -f1)
-        local rule_dst_port=$(echo "$dst_info" | cut -d':' -f2)
+    # 判断是通过ID还是通过源端口和协议获取规则
+    if [[ "$param1" =~ ^[0-9]+$ && -z "$param2" ]]; then
+        # 通过ID获取规则
+        if ! get_rule_by_id "$param1"; then
+            return 1
+        fi
+        # get_rule_by_id 已经设置了全局变量，直接返回
+        return 0
     else
-        # 尝试另一种格式
-        dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+\s+[0-9]+' | sed 's/dnat to /:/')
+        # 通过源端口和协议获取规则（原有逻辑）
+        src_port="$param1"
+        protocol="$param2"
+        
+        # 获取规则信息
+        local rule_info=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | \
+                         grep "${protocol} dport ${src_port}")
+        
+        if [[ -z "$rule_info" ]]; then
+            return 1
+        fi
+        
+        # 提取协议
+        local rule_protocol=$(echo "$rule_info" | grep -oE '\b(tcp|udp)\b' | head -1)
+        [[ -z "$rule_protocol" ]] && rule_protocol="tcp"
+        
+        # 提取源端口
+        local rule_src_port=$(echo "$rule_info" | grep -oE 'dport\s+[0-9]+' | awk '{print $2}' | head -1)
+        
+        # 提取目标信息
+        local dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+:[0-9]+' | sed 's/dnat to //')
         if [[ -n "$dst_info" ]]; then
-            rule_dst_ip=$(echo "$dst_info" | cut -d':' -f1)
-            rule_dst_port=$(echo "$dst_info" | cut -d':' -f2)
+            local rule_dst_ip=$(echo "$dst_info" | cut -d':' -f1)
+            local rule_dst_port=$(echo "$dst_info" | cut -d':' -f2)
         else
-            # 尝试第三种格式（不带冒号）
-            dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+' | sed 's/dnat to //')
+            # 尝试另一种格式
+            dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+\s+[0-9]+' | sed 's/dnat to /:/')
             if [[ -n "$dst_info" ]]; then
-                rule_dst_ip="$dst_info"
-                rule_dst_port="$rule_src_port"  # 假设目标端口与源端口相同
+                rule_dst_ip=$(echo "$dst_info" | cut -d':' -f1)
+                rule_dst_port=$(echo "$dst_info" | cut -d':' -f2)
             else
-                rule_dst_ip="unknown"
-                rule_dst_port="unknown"
+                # 尝试第三种格式（不带冒号）
+                dst_info=$(echo "$rule_info" | grep -oE 'dnat\s+to\s+[0-9.]+' | sed 's/dnat to //')
+                if [[ -n "$dst_info" ]]; then
+                    rule_dst_ip="$dst_info"
+                    rule_dst_port="$rule_src_port"  # 假设目标端口与源端口相同
+                else
+                    rule_dst_ip="unknown"
+                    rule_dst_port="unknown"
+                fi
             fi
         fi
+        
+        # 提取接口
+        local rule_interface=$(echo "$rule_info" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1)
+        [[ -z "$rule_interface" ]] && rule_interface=""
+        
+        # 提取注释
+        local rule_comment=$(extract_rule_comment "$rule_info")
+        [[ -z "$rule_comment" ]] && rule_comment=""
+        
+        # 输出规则信息，使用全局变量返回结果
+        RULE_PROTOCOL="$rule_protocol"
+        RULE_SRC_PORT="$rule_src_port"
+        RULE_DST_IP="$rule_dst_ip"
+        RULE_DST_PORT="$rule_dst_port"
+        RULE_INTERFACE="$rule_interface"
+        RULE_COMMENT="$rule_comment"
+        
+        return 0
     fi
-    
-    # 提取接口
-    local rule_interface=$(echo "$rule_info" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' | head -1)
-    [[ -z "$rule_interface" ]] && rule_interface=""
-    
-    # 提取注释
-    local rule_comment=$(extract_rule_comment "$rule_info")
-    [[ -z "$rule_comment" ]] && rule_comment=""
-    
-    # 输出规则信息，使用全局变量返回结果
-    RULE_PROTOCOL="$rule_protocol"
-    RULE_SRC_PORT="$rule_src_port"
-    RULE_DST_IP="$rule_dst_ip"
-    RULE_DST_PORT="$rule_dst_port"
-    RULE_INTERFACE="$rule_interface"
-    RULE_COMMENT="$rule_comment"
-    
-    return 0
 }
 
 # 增强的输入函数，支持显示原值和处理空输入
@@ -783,6 +862,14 @@ interactive_create() {
 interactive_delete() {
     echo
     list_forwards
+    
+    # 检查是否存在规则
+    if ! check_nftables_initialized || ! nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | grep -q "dnat to"; then
+        log_warning "没有找到端口转发规则"
+        log_info "请先创建端口转发规则，然后返回主菜单"
+        return 0
+    fi
+    
     echo
     
     read -p "请输入要删除的源端口: " src_port
@@ -802,6 +889,14 @@ interactive_delete() {
 interactive_modify() {
     echo
     list_forwards
+    
+    # 检查是否存在规则
+    if ! check_nftables_initialized || ! nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | grep -q "dnat to"; then
+        log_warning "没有找到端口转发规则"
+        log_info "请先创建端口转发规则，然后返回主菜单"
+        return 0
+    fi
+    
     echo
     
     read -p "请输入要修改的源端口: " old_src_port
@@ -908,40 +1003,23 @@ nftables端口转发管理脚本
 用法: $0 [选项]
 
 选项:
-    -l, --list                     列出所有端口转发规则
-    -c, --create                   交互式创建端口转发规则
-    -d, --delete                   交互式删除端口转发规则
-    -m, --modify                   交互式修改端口转发规则
-    -s, --save                     保存当前规则到配置文件
     -h, --help                     显示帮助信息
 
-非交互式用法:
-    $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface] [comment]
-    $0 delete <src_port> [protocol]
+交互式使用:
+    $0                              # 启动交互式主菜单
 
-示例:
-    $0 --list                                    # 列出所有规则
-    $0 create tcp 8080 192.168.1.100 80        # 创建TCP端口转发（自动初始化环境）
-    $0 create udp 53 8.8.8.8 53 eth0          # 在eth0接口创建UDP端口转发
-    $0 create tcp 8081 192.168.1.101 80 "" "Web服务器" # 创建带注释的TCP端口转发
-    $0 delete 8080 tcp                          # 删除TCP端口8080的转发规则
-
-规则修改功能:
-    - 修改规则时支持直接按回车保留原值
-    - 显示当前规则的所有参数作为默认值
-    - 支持选择性修改规则中的任意参数
-
-注释功能:
-    - 支持为端口转发规则添加注释，便于管理和识别
-    - 注释长度限制为128个字符
-    - 在规则列表中显示注释，过长注释会被截断
-    - 创建和修改规则时都可以添加或修改注释
+功能说明:
+    - 列出所有端口转发规则
+    - 创建端口转发规则
+    - 删除端口转发规则
+    - 修改端口转发规则
 
 注意:
     - 此脚本需要root权限运行
     - 首次创建端口转发时会自动初始化nftables环境
-    - 在修改规则时，直接按回车键将保留原有值
+    - 所有操作通过交互式菜单完成
     - 注释功能需要nftables支持comment关键字
+    - ID在每次操作时重新分配，请以最新列表显示的ID为准
 EOF
 }
 
@@ -975,72 +1053,13 @@ main() {
     check_root
     check_system
     
+    # 只保留帮助参数处理，其他所有情况都显示主菜单
     case "${1:-}" in
-        -l|--list)
-            list_forwards
-            ;;
-        -c|--create)
-            interactive_create
-            ;;
-        -d|--delete)
-            interactive_delete
-            ;;
-        -m|--modify)
-            interactive_modify
-            read -p "按回车键继续..."
-            show_menu
-            ;;
-        -s|--save)
-            save_config
-            ;;
         -h|--help)
             show_help
             ;;
-        create)
-            # 必需参数
-            if [[ $# -lt 5 ]]; then
-                log_error "参数不足。用法: $0 create <protocol> <src_port> <dst_ip> <dst_port> [interface] [comment]"
-                exit 1
-            fi
-            
-            local protocol="$2"
-            local src_port="$3"
-            local dst_ip="$4"
-            local dst_port="$5"
-            local interface="${6:-}"
-            local comment="${7:-}"
-            
-            # 如果第6个参数是空字符串，则注释在第7个参数中
-            if [[ $# -ge 6 && -z "$6" ]]; then
-                interface=""
-                if [[ $# -ge 7 ]]; then
-                    comment="$7"
-                else
-                    comment=""
-                fi
-            # 如果第6个参数看起来像注释（不是接口名），则调整参数
-            elif [[ $# -ge 6 && ! "$6" =~ ^[a-zA-Z0-9]+$ ]]; then
-                interface=""
-                comment="$6"
-            fi
-            
-            create_forward "$protocol" "$src_port" "$dst_ip" "$dst_port" "$interface" "$comment"
-            ;;
-        delete)
-            if [[ $# -ge 2 ]]; then
-                delete_forward "$2" "${3:-tcp}"
-            else
-                log_error "参数不足。用法: $0 delete <src_port> [protocol]"
-                exit 1
-            fi
-            ;;
-        "")
-            show_menu
-            ;;
         *)
-            log_error "未知选项: $1"
-            show_help
-            exit 1
+            show_menu
             ;;
     esac
 }
