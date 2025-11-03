@@ -449,6 +449,54 @@ create_forward() {
         comment=$(escape_comment "$comment")
     fi
     
+    # 修复：添加规则存在性检查，避免创建重复规则
+    log_info "检查是否已存在相同的端口转发规则..."
+    
+    # 修复：使用更灵活的查询方式，不依赖字段顺序
+    local existing_rules=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null)
+    local existing_rule=""
+    
+    # 检查是否存在相同的DNAT规则
+    if [[ -n "$interface" ]]; then
+        # 带接口的规则检查
+        existing_rule=$(echo "$existing_rules" | grep -E "iifname\s+\"$interface\".*${protocol}\s+dport\s+${src_port}")
+    else
+        # 不带接口的规则检查
+        existing_rule=$(echo "$existing_rules" | grep -E "${protocol}\s+dport\s+${src_port}")
+    fi
+    
+    if [[ -n "$existing_rule" ]]; then
+        # 进一步检查目标IP和端口是否相同
+        local existing_dst=$(echo "$existing_rule" | grep -oE 'dnat\s+to\s+[0-9.:]+' | sed 's/dnat to //')
+        
+        # 修复：对于带接口的规则，需要更严格的匹配
+        if [[ -n "$interface" ]]; then
+            # 检查现有规则是否也包含相同的接口
+            local existing_interface=$(echo "$existing_rule" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//')
+            
+            if [[ "$existing_interface" == "$interface" && "$existing_dst" == "${dst_ip}:${dst_port}" ]]; then
+                log_warning "已存在相同的端口转发规则: ${src_port} -> ${dst_ip}:${dst_port} (${protocol}, 接口: ${interface})"
+                log_info "如需修改现有规则，请先删除原规则再创建新规则"
+                return 1
+            elif [[ "$existing_interface" == "$interface" ]]; then
+                log_warning "端口 ${src_port} 在接口 ${interface} 上已被其他规则使用，目标为: $existing_dst"
+                log_info "请选择其他源端口或先删除现有规则"
+                return 1
+            fi
+        else
+            # 不带接口的规则检查
+            if [[ "$existing_dst" == "${dst_ip}:${dst_port}" ]]; then
+                log_warning "已存在相同的端口转发规则: ${src_port} -> ${dst_ip}:${dst_port} (${protocol})"
+                log_info "如需修改现有规则，请先删除原规则再创建新规则"
+                return 1
+            else
+                log_warning "端口 ${src_port} 已被其他规则使用，目标为: $existing_dst"
+                log_info "请选择其他源端口或先删除现有规则"
+                return 1
+            fi
+        fi
+    fi
+    
     # 构建规则
     local rule="add rule ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING}"
     
@@ -525,10 +573,15 @@ delete_forward() {
         return 1
     fi
     
-    log_info "删除端口 ${src_port} 的${protocol}转发规则..."
-    
     # 获取当前所有规则
     local current_rules=$(nft list ruleset 2>/dev/null)
+    
+    # 修复：增强SNAT规则的匹配逻辑，先获取DNAT规则的目标IP
+    local dst_ip=""
+    local dnat_rule=$(echo "$current_rules" | grep "${protocol} dport ${src_port}.*dnat to")
+    if [[ -n "$dnat_rule" ]]; then
+        dst_ip=$(echo "$dnat_rule" | grep -oE 'dnat\s+to\s+[0-9.]+' | sed 's/dnat to //')
+    fi
     
     # 检查是否存在匹配的规则
     local has_prerouting_rule=false
@@ -538,8 +591,16 @@ delete_forward() {
         has_prerouting_rule=true
     fi
     
-    if echo "$current_rules" | grep -q "ip daddr .* ${protocol} dport ${src_port}.*masquerade"; then
-        has_postrouting_rule=true
+    # 修复：增强SNAT规则的匹配条件，使用目标IP进行更精确的匹配
+    if [[ -n "$dst_ip" ]]; then
+        if echo "$current_rules" | grep -q "ip daddr ${dst_ip}.*${protocol} dport.*masquerade"; then
+            has_postrouting_rule=true
+        fi
+    else
+        # 如果无法获取目标IP，使用原有逻辑
+        if echo "$current_rules" | grep -q "ip daddr .* ${protocol} dport ${src_port}.*masquerade"; then
+            has_postrouting_rule=true
+        fi
     fi
     
     if [[ "$has_prerouting_rule" == false && "$has_postrouting_rule" == false ]]; then
@@ -557,21 +618,32 @@ delete_forward() {
     local in_prerouting_chain=false
     local in_postrouting_chain=false
     local skip_line=false
+    local brace_count=0  # 用于跟踪大括号的层级
     
     while IFS= read -r line; do
         # 跟踪当前所在的位置
         if [[ "$line" =~ ^[[:space:]]*table[[:space:]]+ip[[:space:]]+nat[[:space:]]*\{ ]]; then
             in_nat_table=true
+            brace_count=1  # 进入表，大括号计数为1
             echo "$line" >> "$new_temp_file"
             continue
         fi
         
-        if [[ "$in_nat_table" == true && "$line" =~ ^[[:space:]]*\} ]]; then
+        # 修复：只有在brace_count为1时才认为是退出nat表
+        if [[ "$in_nat_table" == true && "$line" =~ ^[[:space:]]*\} && $brace_count -eq 1 ]]; then
             in_nat_table=false
             in_prerouting_chain=false
             in_postrouting_chain=false
             echo "$line" >> "$new_temp_file"
             continue
+        fi
+        
+        # 更新大括号计数
+        if [[ "$in_nat_table" == true ]]; then
+            # 计算行中的大括号数量
+            local open_braces=$(echo "$line" | grep -o '{' | wc -l)
+            local close_braces=$(echo "$line" | grep -o '}' | wc -l)
+            brace_count=$((brace_count + open_braces - close_braces))
         fi
         
         if [[ "$in_nat_table" == true && "$line" =~ ^[[:space:]]*chain[[:space:]]+prerouting[[:space:]]*\{ ]]; then
@@ -605,15 +677,37 @@ delete_forward() {
         if [[ "$in_prerouting_chain" == true ]]; then
             if [[ "$line" =~ ${protocol}[[:space:]]+dport[[:space:]]+${src_port}.*dnat[[:space:]]+to ]]; then
                 skip_line=true
-                log_info "跳过prerouting规则: $line"
             fi
         fi
         
-        # 修改postrouting规则的匹配条件，使其更准确
+        # 修复：增强postrouting规则的匹配条件，使其更准确
         if [[ "$in_postrouting_chain" == true ]]; then
-            if [[ "$line" =~ ip[[:space:]]+daddr[[:space:]]+.*[[:space:]]+${protocol}[[:space:]]+dport[[:space:]]+${src_port}.*masquerade ]]; then
-                skip_line=true
-                log_info "跳过postrouting规则: $line"
+            # 优先使用目标IP进行精确匹配
+            if [[ -n "$dst_ip" ]]; then
+                # 获取目标端口
+                local dst_port=""
+                if [[ -n "$dnat_rule" ]]; then
+                    dst_port=$(echo "$dnat_rule" | grep -oE 'dnat\s+to\s+[0-9.]+:[0-9]+' | cut -d':' -f2)
+                    [[ -z "$dst_port" ]] && dst_port="$src_port"  # 如果无法获取，使用源端口
+                fi
+                
+                # 使用更简单的字符串匹配，避免复杂的正则表达式
+                if [[ -n "$dst_port" ]]; then
+                    # 精确匹配：IP + 协议 + 端口
+                    if echo "$line" | grep -q "ip daddr ${dst_ip}.*${protocol} dport ${dst_port}.*masquerade"; then
+                        skip_line=true
+                    fi
+                else
+                    # 如果无法获取目标端口，只使用目标IP和协议匹配
+                    if echo "$line" | grep -q "ip daddr ${dst_ip}.*${protocol} dport.*masquerade"; then
+                        skip_line=true
+                    fi
+                fi
+            else
+                # 如果无法获取目标IP，使用原有逻辑
+                if echo "$line" | grep -q "ip daddr .*${protocol} dport ${src_port}.*masquerade"; then
+                    skip_line=true
+                fi
             fi
         fi
         
@@ -728,6 +822,12 @@ refresh_nftables_state() {
 extract_rule_info() {
     local param1="$1"
     local param2="${2:-}"
+    
+    # 修复：添加空值检查，处理空ID的情况
+    if [[ -z "$param1" ]]; then
+        log_error "错误：传入的ID或参数为空"
+        return 1
+    fi
     
     local src_port=""
     local protocol="tcp"
@@ -912,14 +1012,65 @@ delete_forwards() {
     
     echo
     
-    read -p "请输入要删除的源端口: " src_port
-    read -p "请输入协议 [tcp/udp，默认tcp]: " protocol
-    protocol=${protocol:-tcp}
+    # 添加提示信息
+    echo "请记下要删除规则的ID（第一列）"
+    echo
     
-    read -p "确认删除端口 ${src_port} 的${protocol}转发规则吗？ [y/N]: " confirm
+    # 添加输入重试机制（最多3次尝试）
+    local max_attempts=3
+    local attempt=1
+    local rule_id=""
+    local valid_input=false
+    
+    while [[ $attempt -le $max_attempts && $valid_input == false ]]; do
+        read -p "请输入要删除的规则ID（输入q退出）: " rule_id
+        
+        # 检查是否要退出
+        if [[ "$rule_id" == "q" || "$rule_id" == "Q" ]]; then
+            log_info "操作已取消"
+            return 0
+        fi
+        
+        # 验证规则ID
+        if validate_rule_id "$rule_id"; then
+            valid_input=true
+        else
+            ((attempt++))
+            if [[ $attempt -le $max_attempts ]]; then
+                log_warning "输入无效，请重试（剩余尝试次数: $((max_attempts - attempt + 1))）"
+            fi
+        fi
+    done
+    
+    # 如果所有尝试都失败，退出
+    if [[ $valid_input == false ]]; then
+        log_error "输入错误次数过多，操作已取消"
+        return 1
+    fi
+    
+    # 使用规则ID提取规则信息
+    if ! extract_rule_info "$rule_id"; then
+        log_error "无法获取规则ID $rule_id 的详细信息"
+        return 1
+    fi
+    
+    # 显示要删除的规则信息
+    echo
+    echo "将要删除的规则信息："
+    echo "ID: $rule_id"
+    echo "协议: $RULE_PROTOCOL"
+    echo "源端口: $RULE_SRC_PORT"
+    echo "目标IP: $RULE_DST_IP"
+    echo "目标端口: $RULE_DST_PORT"
+    echo "网络接口: ${RULE_INTERFACE:-"所有接口"}"
+    echo "注释: ${RULE_COMMENT:-"无"}"
+    echo
+    
+    read -p "确认删除此规则吗？ [y/N]: " confirm
     
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        delete_forward "$src_port" "$protocol"
+        # 调用原有的delete_forward函数执行删除操作
+        delete_forward "$RULE_SRC_PORT" "$RULE_PROTOCOL"
     else
         log_info "操作已取消"
     fi
