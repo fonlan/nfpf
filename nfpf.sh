@@ -948,12 +948,12 @@ create_forwards() {
     
     # 选择协议
     echo "请选择协议："
-    echo "1) TCP"
+    echo "1) TCP (默认)"
     echo "2) UDP"
-    read -p "请选择 [1-2]: " protocol_choice
+    read -p "请选择 [1-2，直接回车选择TCP]: " protocol_choice
     
     case $protocol_choice in
-        1) protocol="tcp" ;;
+        1| "") protocol="tcp" ;;
         2) protocol="udp" ;;
         *) log_error "无效选择"; return 1 ;;
     esac
@@ -1166,7 +1166,7 @@ modify_forwards() {
     echo "请输入新的规则信息（直接按回车保留原值）："
     
     # 使用增强的输入函数，支持显示原值和处理空输入
-    local new_protocol=$(prompt_with_default "协议 [tcp/udp]" "$RULE_PROTOCOL")
+    local new_protocol=$(prompt_with_default "协议 [tcp/udp，默认tcp]" "$RULE_PROTOCOL")
     local new_src_port=$(prompt_with_default "源端口" "$RULE_SRC_PORT")
     local new_dst_ip=$(prompt_with_default "目标IP" "$RULE_DST_IP")
     local new_dst_port=$(prompt_with_default "目标端口" "$RULE_DST_PORT")
