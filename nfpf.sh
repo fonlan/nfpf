@@ -840,7 +840,7 @@ save_config() {
 # 交互式创建端口转发
 create_forwards() {
     echo
-    log_info "创建新的端口转发规则"
+    list_forwards
     echo
     
     # 选择协议
