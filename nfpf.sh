@@ -234,7 +234,7 @@ list_forwards() {
     if ! check_nftables_initialized; then
         log_warning "nftables环境未初始化"
         log_info "请先创建一个端口转发规则，系统将自动初始化环境"
-        return 0
+        return 1  # 返回1表示没有规则
     fi
     
     # 强制刷新nftables状态，确保获取最新规则
@@ -247,7 +247,7 @@ list_forwards() {
     if ! echo "$rules_output" | grep -q "dnat to"; then
         log_warning "没有找到端口转发规则"
         log_info "请先创建端口转发规则，然后返回主菜单"
-        return 0
+        return 1  # 返回1表示没有规则
     fi
     
     # 显示表头
@@ -268,7 +268,10 @@ list_forwards() {
         done <<< "$rules"
     else
         log_warning "未找到任何端口转发规则"
+        return 1  # 返回1表示没有规则
     fi
+    
+    return 0  # 返回0表示有规则存在
 }
 
 # 解析并显示单个规则
@@ -940,7 +943,7 @@ save_config() {
 # 交互式创建端口转发
 create_forwards() {
     echo
-    list_forwards
+    list_forwards || true  # 即使没有规则也继续执行
     echo
     
     # 选择协议
@@ -1001,12 +1004,8 @@ create_forwards() {
 # 交互式删除端口转发
 delete_forwards() {
     echo
-    list_forwards
-    
-    # 检查是否存在规则
-    if ! check_nftables_initialized || ! nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | grep -q "dnat to"; then
-        log_warning "没有找到端口转发规则"
-        log_info "请先创建端口转发规则，然后返回主菜单"
+    # 检查是否有规则存在
+    if ! list_forwards; then
         return 0
     fi
     
@@ -1104,12 +1103,8 @@ validate_rule_id() {
 # 交互式修改端口转发
 modify_forwards() {
     echo
-    list_forwards
-    
-    # 检查是否存在规则
-    if ! check_nftables_initialized || ! nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null | grep -q "dnat to"; then
-        log_warning "没有找到端口转发规则"
-        log_info "请先创建端口转发规则，然后返回主菜单"
+    # 检查是否有规则存在
+    if ! list_forwards; then
         return 0
     fi
     
@@ -1287,10 +1282,10 @@ show_menu() {
     read -p "请选择操作 [0-4]: " choice
     
     case $choice in
-        1) list_forwards; read -p "按回车键继续..."; show_menu ;;
-        2) create_forwards; read -p "按回车键继续..."; show_menu ;;
-        3) delete_forwards; read -p "按回车键继续..."; show_menu ;;
-        4) modify_forwards; read -p "按回车键继续..."; show_menu ;;
+        1) list_forwards || true; read -p "按任意键返回主菜单..." -n 1; show_menu ;;
+        2) create_forwards; read -p "按任意键返回主菜单..." -n 1; show_menu ;;
+        3) delete_forwards; read -p "按任意键返回主菜单..." -n 1; show_menu ;;
+        4) modify_forwards; read -p "按任意键返回主菜单..." -n 1; show_menu ;;
         0) log_info "退出程序"; exit 0 ;;
         *) log_error "无效选择"; sleep 1; show_menu ;;
     esac
