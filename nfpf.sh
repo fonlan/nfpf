@@ -4,14 +4,6 @@
 # 适用于Debian系Linux发行版
 # 作者: fonlan
 # 版本: 1.1
-#
-# 更新日志:
-# v1.1 - 添加修改端口转发规则时支持直接按回车使用原值的功能
-#       - 新增 extract_rule_info() 函数，用于提取规则的完整信息
-#       - 新增 prompt_with_default() 函数，支持显示原值和处理空输入
-#       - 修改 interactive_modify() 函数，支持在修改规则时直接按回车保留原值
-#       - 修改 interactive_set_comment() 函数，支持在设置注释时直接按回车保留原值
-#       - 修改 interactive_clear_comment() 函数，使用统一的规则信息提取方式
 
 set -euo pipefail
 
@@ -713,7 +705,7 @@ verify_forward_rule() {
 
 # 刷新nftables状态
 refresh_nftables_state() {
-    log_info "刷新nftables状态..."
+    # log_info "刷新nftables状态..."
     
     # 强制重新读取nftables状态
     nft list ruleset >/dev/null 2>&1
@@ -846,7 +838,7 @@ save_config() {
 }
 
 # 交互式创建端口转发
-interactive_create() {
+create_forwards() {
     echo
     log_info "创建新的端口转发规则"
     echo
@@ -907,7 +899,7 @@ interactive_create() {
 }
 
 # 交互式删除端口转发
-interactive_delete() {
+delete_forwards() {
     echo
     list_forwards
     
@@ -959,7 +951,7 @@ validate_rule_id() {
 }
 
 # 交互式修改端口转发
-interactive_modify() {
+modify_forwards() {
     echo
     list_forwards
     
@@ -1145,9 +1137,9 @@ show_menu() {
     
     case $choice in
         1) list_forwards; read -p "按回车键继续..."; show_menu ;;
-        2) interactive_create; read -p "按回车键继续..."; show_menu ;;
-        3) interactive_delete; read -p "按回车键继续..."; show_menu ;;
-        4) interactive_modify; read -p "按回车键继续..."; show_menu ;;
+        2) create_forwards; read -p "按回车键继续..."; show_menu ;;
+        3) delete_forwards; read -p "按回车键继续..."; show_menu ;;
+        4) modify_forwards; read -p "按回车键继续..."; show_menu ;;
         0) log_info "退出程序"; exit 0 ;;
         *) log_error "无效选择"; sleep 1; show_menu ;;
     esac
