@@ -1011,10 +1011,6 @@ delete_forwards() {
     
     echo
     
-    # 添加提示信息
-    echo "请记下要删除规则的ID（第一列）"
-    echo
-    
     # 添加输入重试机制（最多3次尝试）
     local max_attempts=3
     local attempt=1
@@ -1108,10 +1104,6 @@ modify_forwards() {
         return 0
     fi
     
-    echo
-    
-    # 添加提示信息
-    echo "请记下要修改规则的ID（第一列）"
     echo
     
     # 添加输入重试机制（最多3次尝试）
