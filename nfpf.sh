@@ -456,26 +456,60 @@ create_forward() {
     log_info "检查是否已存在相同的端口转发规则..."
     
     # 修复：使用更灵活的查询方式，不依赖字段顺序
-    local existing_rules=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null)
+    local existing_rules=""
+    if ! existing_rules=$(nft list chain ip ${NFT_TABLE} ${NFT_CHAIN_PREROUTING} 2>/dev/null); then
+        log_error "无法获取nftables规则列表"
+        return 1
+    fi
+    
+    # 添加调试信息
+    log_info "正在检查协议: $protocol, 源端口: $src_port"
+    if [[ -n "$interface" ]]; then
+        log_info "指定接口: $interface"
+    fi
+    
+    # 验证必要变量是否为空
+    if [[ -z "$protocol" || -z "$src_port" ]]; then
+        log_error "协议或源端口为空，无法检查规则"
+        return 1
+    fi
+    
     local existing_rule=""
     
     # 检查是否存在相同的DNAT规则
     if [[ -n "$interface" ]]; then
-        # 带接口的规则检查
-        existing_rule=$(echo "$existing_rules" | grep -E "iifname\s+\"$interface\".*${protocol}\s+dport\s+${src_port}")
+        # 带接口的规则检查 - 添加错误处理和变量转义
+        if ! existing_rule=$(echo "$existing_rules" | grep -E "iifname\s+\"$interface\".*${protocol}\s+dport\s+${src_port}" 2>/dev/null); then
+            # grep命令失败时，existing_rule为空，继续执行
+            existing_rule=""
+        fi
     else
-        # 不带接口的规则检查
-        existing_rule=$(echo "$existing_rules" | grep -E "${protocol}\s+dport\s+${src_port}")
+        # 不带接口的规则检查 - 添加错误处理和变量转义
+        if ! existing_rule=$(echo "$existing_rules" | grep -E "${protocol}\s+dport\s+${src_port}" 2>/dev/null); then
+            # grep命令失败时，existing_rule为空，继续执行
+            existing_rule=""
+        fi
     fi
     
     if [[ -n "$existing_rule" ]]; then
-        # 进一步检查目标IP和端口是否相同
-        local existing_dst=$(echo "$existing_rule" | grep -oE 'dnat\s+to\s+[0-9.:]+' | sed 's/dnat to //')
+        # 添加调试信息
+        log_info "发现现有规则: $existing_rule"
+        
+        # 进一步检查目标IP和端口是否相同 - 添加错误处理
+        local existing_dst=""
+        if ! existing_dst=$(echo "$existing_rule" | grep -oE 'dnat\s+to\s+[0-9.:]+' | sed 's/dnat to //' 2>/dev/null); then
+            existing_dst=""
+        fi
+        
+        log_info "现有规则目标: $existing_dst"
         
         # 修复：对于带接口的规则，需要更严格的匹配
         if [[ -n "$interface" ]]; then
-            # 检查现有规则是否也包含相同的接口
-            local existing_interface=$(echo "$existing_rule" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//')
+            # 检查现有规则是否也包含相同的接口 - 添加错误处理
+            local existing_interface=""
+            if ! existing_interface=$(echo "$existing_rule" | grep -oE 'iifname\s+"[^"]*"' | sed 's/iifname "//; s/"//' 2>/dev/null); then
+                existing_interface=""
+            fi
             
             if [[ "$existing_interface" == "$interface" && "$existing_dst" == "${dst_ip}:${dst_port}" ]]; then
                 log_warning "已存在相同的端口转发规则: ${src_port} -> ${dst_ip}:${dst_port} (${protocol}, 接口: ${interface})"
